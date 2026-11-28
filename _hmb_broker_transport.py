@@ -247,8 +247,17 @@ class _CloudReferenceCheckError(_BrokerError):
         "invalid_cloud_url", "griptape_signed_url_required", "upload_digest_required", "reference_size_limit",
         "cloud_http_status", "cloud_length_mismatch", "cloud_encoding_invalid", "cloud_sha256_mismatch",
         "cloud_timeout", "cloud_transport_error", "cloud_request_invalid", "cloud_reference_count",
-        "cloud_preflight_busy",
+        "cloud_preflight_busy", "cloud_media_decode_failed",
     })
+    image_fields = frozenset({"image_urls", "first_frame", "last_frame"})
+    media_actions = {
+        "reference_size_limit": "참조 파일 용량이 허용 한도를 넘었습니다. 용량을 줄인 뒤 다시 첨부하세요.",
+        "cloud_media_decode_failed": "참조 파일을 끝까지 읽을 수 없습니다. 원본에서 다시 저장한 파일을 첨부하세요.",
+    }
+    image_actions = {
+        "reference_size_limit": "이미지 용량이 허용 한도를 넘었습니다. 30,000,000바이트 미만으로 줄인 뒤 다시 첨부하세요.",
+        "cloud_media_decode_failed": "이미지 픽셀을 읽을 수 없습니다. 원본에서 다시 저장한 이미지를 첨부하세요.",
+    }
 
     @staticmethod
     def _metric(value: Any) -> str:
@@ -267,7 +276,11 @@ class _CloudReferenceCheckError(_BrokerError):
         error = cls(message, status_code=status)
         error.rows = []
         if private:
-            error.args = (message + "\nMy Box는 오류 코드만 제공합니다. 파일별 시도 내역은 이 요청의 브로커 로그에서 확인하세요.",)
+            action = cls.media_actions.get(code)
+            if action:
+                error.args = (message + "\n" + action + "\nMy Box의 파일별 시도 내역은 이 요청의 브로커 로그에서 확인하세요.",)
+            else:
+                error.args = (message + "\nMy Box는 오류 코드만 제공합니다. 파일별 시도 내역은 이 요청의 브로커 로그에서 확인하세요.",)
             return error
         files = data.get("files")
         for row in files[:50] if isinstance(files, list) else ():
@@ -277,6 +290,14 @@ class _CloudReferenceCheckError(_BrokerError):
             if (not isinstance(field, str) or field not in cls.limits or type(index) is not int
                     or not 0 <= index < cls.limits[field] or not isinstance(attempts, list) or not 1 <= len(attempts) <= 2
                     or not isinstance(attempts[-1], dict) or attempts[-1].get("result") == "ok"):
+                continue
+            result = attempts[-1].get("result")
+            action = cls.image_actions.get(result) if field in cls.image_fields and isinstance(result, str) else None
+            if action:
+                size = row.get("expected_bytes")
+                if type(size) is int and 0 < size < 10**12:
+                    action = f"전송 파일 크기 {size:,}바이트 · {action}"
+                error.rows.append((field, index, action, True))
                 continue
             for attempt in attempts:
                 if not isinstance(attempt, dict):
@@ -294,20 +315,31 @@ class _CloudReferenceCheckError(_BrokerError):
                     stage = "응답 헤더 수신 전"
                 error.rows.append((field, index,
                     f"{stage} · {result} · 시도 {cls._metric(attempt.get('number'))} · "
-                    f"수신 {cls._metric(attempt.get('bytes'))} B · 소요 {cls._metric(attempt.get('total_ms'))} ms"))
+                    f"수신 {cls._metric(attempt.get('bytes'))} B · 소요 {cls._metric(attempt.get('total_ms'))} ms", False))
         if error.rows:
             error.with_sources({})
         else:
+            action = cls.media_actions.get(code)
+            if action:
+                message += "\n" + action
             error.args = (message + "\n파일별 내역이 응답에 없습니다. 브로커 로그에서 이 요청을 확인하세요.",)
         return error
 
     def with_sources(self, sources: dict) -> None:
         if self.rows:
             lines = [str(self).split("\n", 1)[0]]
-            for field, index, detail in self.rows:
+            for field, index, detail, image_action in self.rows:
                 source = sources.get((field, index))
-                label = f"슬롯 {source[0]} · {source[1]}" if source else "원본 슬롯 미확인"
-                lines.append(f"{field}[{index}] · {label} · {detail}")
+                if image_action:
+                    if field == "image_urls":
+                        label = f"참조 이미지 {source[0]}번" if source else f"전송 이미지 {index + 1}번"
+                    else:
+                        label = "첫 프레임" if field == "first_frame" else "마지막 프레임"
+                    filename = source[1] if source else "원본 파일명 미확인"
+                    lines.append(f"{label} · {filename} · {detail}")
+                else:
+                    label = f"슬롯 {source[0]} · {source[1]}" if source else "원본 슬롯 미확인"
+                    lines.append(f"{field}[{index}] · {label} · {detail}")
             self.args = ("\n".join(lines),)
 
 

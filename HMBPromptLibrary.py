@@ -787,6 +787,7 @@ _IMAGE_ASSET_ROW_KEYS = frozenset({
     "relative_path",
     "width",
     "height",
+    "media_signature",
     "project_uid",
     "image_main_type",
     "image_sub_type",
@@ -2528,6 +2529,29 @@ def _normalize_ui(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _normalize_asset_registration(value: Any) -> Dict[str, Any]:
+    """Keep the registered source description distinct from Shot authoring."""
+    if not isinstance(value, dict) or not _clean_string(value.get("image_name")):
+        return {}
+    registration = {
+        key: _clean_string(value.get(key))
+        for key in (
+            "image_name", "image_main_type", "image_sub_type", "source_type",
+            "custom_source_type", "scope_candidate",
+        )
+    }
+    colors = value.get("color_pick_candidates")
+    registration["color_pick_candidates"] = (
+        list(dict.fromkeys(_clean_string(color) for color in colors if _clean_string(color)))
+        if isinstance(colors, (tuple, list)) else []
+    )
+    for axis in ("width", "height"):
+        dimension = value.get(axis)
+        if type(dimension) is int and dimension > 0:
+            registration[axis] = dimension
+    return registration if not _metadata_contains_private_media(registration) else {}
+
+
 def _normalize_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
     out = _default_image_item(slot)
     out["label"] = _clean_string(item.get("label") or item.get("name_override") or item.get("description"))
@@ -2584,6 +2608,9 @@ def _normalize_image_item(item: Dict[str, Any], slot: int) -> Dict[str, Any]:
         item.get("asset_verified")
         and asset_source_kind == "project"
     )
+    registration = _normalize_asset_registration(item.get("asset_registration"))
+    if registration and out["asset_verified"] and out["asset_managed"]:
+        out["asset_registration"] = registration
     out["image_main_type"] = _clean_string(item.get("image_main_type"))
     out["image_sub_type"] = _clean_string(item.get("image_sub_type"))
     out["source_type"] = _clean_string(item.get("source_type")) or out["source_type"]
@@ -3559,6 +3586,24 @@ def _metadata_contains_private_media(value: Any) -> bool:
     return _looks_like_private_media_string(value)
 
 
+def _image_snapshot_metadata_contains_private_media(metadata: Dict[str, Any], source_uid: str) -> bool:
+    if "relative_path" not in metadata:
+        return _metadata_contains_private_media(metadata)
+    path = metadata["relative_path"]
+    library_id = _clean_string(metadata.get("asset_library_id"))
+    if (metadata.get("verified_asset") is not True or metadata.get("source_kind") != "project"
+            or not library_id or source_uid != f"project:{library_id}"
+            or not isinstance(path, str) or not path or len(path) > 4096
+            or path != path.strip() or any(ord(character) < 32 for character in path)):
+        return True
+    parts = path.split("/")
+    if re.fullmatch(r"site:[0-9A-Za-z_-]{1,128}", parts[0]):
+        parts = parts[1:]
+    if not parts or any(part in {"", ".", ".."} or any(mark in part for mark in '\\:<>"|?*') for part in parts):
+        return True
+    return _metadata_contains_private_media({key: value for key, value in metadata.items() if key != "relative_path"})
+
+
 def _canonical_sha256(value: Any) -> str:
     try:
         encoded = json.dumps(
@@ -3820,7 +3865,7 @@ def _validate_shot_routing_snapshot(
             or len(source_uid) > MAX_IDENTIFIER_CHARS
             or source_uid in ordered_uids
             or not isinstance(metadata, dict)
-            or _metadata_contains_private_media(metadata)
+            or _image_snapshot_metadata_contains_private_media(metadata, source_uid)
         ):
             raise _ShotRoutingContractError(
                 "A routed source address is empty/duplicated or exposes media."
@@ -5089,6 +5134,26 @@ def _verified_project_image(item: Dict[str, Any]) -> bool:
     )
 
 
+def _uses_registered_image_default(item: Dict[str, Any], field: str) -> bool:
+    if not _verified_project_image(item):
+        return False
+    registration = item.get("asset_registration") or {}
+    if field == "image_sub_type":
+        if not registration and not _clean_string(item.get("asset_image_main_type_candidate")):
+            return False
+        value = registration.get("image_sub_type", item.get("asset_image_sub_type_candidate"))
+        default = "" if value == _ANALYSIS_SUB_TYPE else _clean_string(value)
+    elif field == "custom_source_type":
+        if not registration:
+            return False
+        default = _clean_string(registration.get("custom_source_type"))
+    else:
+        default = _clean_string(item.get("asset_default_target"))
+        if not default:
+            return False
+    return _clean_string(item.get(field)) == default
+
+
 def _source_managed_image(item: Dict[str, Any]) -> bool:
     return bool(
         item.get("asset_managed")
@@ -5307,7 +5372,15 @@ def _merge_prompt_revision_axes(
             # This publication recovered the saved row for the same external
             # file. Its previous blank projection is only a hydration echo.
             continue
-        _copy_prompt_ui_fields(item, ui_item, _PROMPT_IMAGE_UI_FIELDS)
+        ui_fields = _PROMPT_IMAGE_UI_FIELDS
+        if (item.get("asset_registration") and
+                item.get("asset_registration") != ui_item.get("asset_registration")):
+            # Preserve edits against the old registration, but an unchanged
+            # default may not roll back the newly synchronized source default.
+            ui_fields = tuple(field for field in ui_fields if
+                field not in {"owner", "image_sub_type", "custom_source_type"} or
+                not _uses_registered_image_default(ui_item, field))
+        _copy_prompt_ui_fields(item, ui_item, ui_fields)
         if not _verified_project_image(item):
             _copy_prompt_ui_fields(
                 item,
@@ -5960,6 +6033,7 @@ def _release_image_asset_row_provenance(item: Dict[str, Any]) -> None:
     item["asset_verified"] = False
     item["asset_source_kind"] = ""
     item["asset_selection_order"] = 0
+    item.pop("asset_registration", None)
 
 
 def _apply_image_asset_payload(
@@ -6271,7 +6345,12 @@ def _apply_image_asset_payload(
                 else None
             )
             if verified_raw is None:
-                verified_raw = verified_by_selection_order.get(selection_order)
+                positional = verified_by_selection_order.get(selection_order)
+                # An explicitly different source must never supply this row's
+                # registration. Only an unaddressed legacy row may use position.
+                if positional is not None and (not order_key or not
+                        _clean_string(positional.get("order_key") or positional.get("source_uid"))):
+                    verified_raw = positional
         else:
             verified_raw = raw
 
@@ -6438,6 +6517,8 @@ def _apply_image_asset_payload(
                 "custom_source_type": custom_source_type,
                 "scope_candidate": scope_candidate,
                 "color_pick_candidates": list(dict.fromkeys(color_candidates)),
+                "width": metadata.get("width"),
+                "height": metadata.get("height"),
                 "selection_order": selection_order,
                 "source_kind": "project" if project_verified else "user",
                 "verified": project_verified,
@@ -6662,8 +6743,9 @@ def _apply_image_asset_payload(
             item["asset_import_source_uid"] = import_uid
         else:
             item.pop("asset_import_source_uid", None)
-        previous_sub_type = _clean_string(item.get("image_sub_type"))
-        previous_custom_source_type = _clean_string(item.get("custom_source_type"))
+        follows_sub_type = created_prompt_row or _uses_registered_image_default(item, "image_sub_type")
+        follows_custom_source = created_prompt_row or _uses_registered_image_default(item, "custom_source_type")
+        follows_target = (created_prompt_row and not _clean_string(item.get("owner"))) or _uses_registered_image_default(item, "owner")
         assigned.add(match_index)
         # Remove an older cached snapshot when the visible/resumable row won.
         _pop_dormant_asset_row(
@@ -6673,7 +6755,7 @@ def _apply_image_asset_payload(
         )
         ordered_managed_rows.append(item)
         item["present"] = True
-        if not _clean_string(item.get("label")):
+        if asset["verified"] or not _clean_string(item.get("label")):
             item["label"] = asset["image_name"]
         item["asset_source_uid"] = asset["source_uid"]
         item["asset_selection_order"] = asset["selection_order"]
@@ -6681,6 +6763,7 @@ def _apply_image_asset_payload(
         item["asset_verified"] = bool(asset["verified"])
         item["asset_source_kind"] = asset["source_kind"]
         if asset["verified"]:
+            item["asset_registration"] = _normalize_asset_registration(asset)
             item["asset_id"] = asset["asset_id"]
             item["asset_path"] = asset["asset_path"]
             item["asset_library_id"] = asset["asset_library_id"]
@@ -6691,23 +6774,20 @@ def _apply_image_asset_payload(
             item["asset_scope_candidate"] = asset["scope_candidate"]
             item["asset_color_pick_candidates"] = asset["color_pick_candidates"]
             item["image_main_type"] = asset["image_main_type"]
-            item["image_sub_type"] = (
-                asset["image_sub_type"] if created_prompt_row and asset["image_sub_type"] != _ANALYSIS_SUB_TYPE
-                else previous_sub_type
-            )
+            if follows_sub_type:
+                item["image_sub_type"] = (
+                    "" if asset["image_sub_type"] == _ANALYSIS_SUB_TYPE else asset["image_sub_type"]
+                )
             item["source_type"] = asset["source_type"]
-            item["custom_source_type"] = (
-                asset["custom_source_type"]
-                if created_prompt_row
-                else previous_custom_source_type
-            )
+            if follows_custom_source:
+                item["custom_source_type"] = asset["custom_source_type"]
             default_target = _default_image_target_for_main_type(
                 item.get("source_type"),
                 asset.get("image_name"),
                 asset.get("asset_id"),
                 item.get("image_sub_type"),
             )
-            if created_prompt_row and not _clean_string(item.get("owner")):
+            if follows_target:
                 item["owner"] = default_target
             item["asset_default_target"] = default_target
             _normalize_image_binding_fields(item, MAX_VIDEOS)
@@ -9824,6 +9904,8 @@ def _public_job_data_contract(
         image_record["custom_look_instruction"] = _clean_string(
             item.get("look_custom_instruction")
         )
+        if _verified_project_image(item) and item.get("asset_registration"):
+            image_record["registration"] = copy.deepcopy(item["asset_registration"])
         surface_instruction = _surface_2d_instruction(item)
         if surface_instruction:
             image_record["surface_2d"] = True
@@ -10468,12 +10550,9 @@ def _prompt_start_metadata(value: Any) -> Dict[str, Any]:
 class HMBPromptLibrary(DataNode):
     """HMBPromptLibrary.
 
-    Independent source-binding and prompt-authoring dashboard with four equal
-    production modes: Prompt only, Prompt + IMAGE_ASSET_IN, Prompt + PICKER_IN,
-    and Prompt + both inputs. IMAGE_ASSET_IN and PICKER_IN are optional in all
-    modes; neither input is a prerequisite.
-    PROMPT_OUT is available in every mode and is the canonical parent edge for
-    HMBAgentLibrary automation.
+    Source-binding and prompt-authoring dashboard for ImageAsset-managed Shots.
+    A verified managed Shot enables PROMPT_OUT for HMBAgentLibrary automation.
+    Video Picker and Sound are optional same-Shot inputs.
     Verified Project Asset data establishes Project, Asset ID, Image Name, and
     optional Main/Sub metadata. Main Type alone is valid broad metadata; an
     optional Sub Type narrows its intended authority. Target and custom intent
@@ -10521,7 +10600,7 @@ class HMBPromptLibrary(DataNode):
         # A newly dragged Prompt should immediately adopt the ImageAsset's
         # active Shot and exact Picker snapshot. Serialized workflows disable
         # this one-shot path as soon as their initial widget state arrives, so
-        # an intentionally saved Only selection remains Only after reload.
+        # an intentionally saved unbound document stays unbound after reload.
         self._hmb_initial_shot_autoclaim_pending = True
         self._hmb_initial_shot_preferred_uuid = ""
         self._hmb_initial_shot_exact_refresh_pending = False
@@ -10534,9 +10613,8 @@ class HMBPromptLibrary(DataNode):
         self.metadata = current_metadata
         self.category = "HMB_GP_Production"
         self.description = (
-            "Independent HMB prompt authoring with four valid modes: Prompt "
-            "only, +Image Asset, +Video Picker, or +both; PROMPT_OUT is always "
-            "available as the canonical HMBAgentLibrary input"
+            "Author prompts for ImageAsset-managed Shots with optional video "
+            "and sound. PROMPT_OUT supplies the verified Shot to HMBAgentLibrary."
         )
         self._hmb_ui_syncing = False
         self._hmb_picker_connected = False
@@ -11213,6 +11291,7 @@ class HMBPromptLibrary(DataNode):
         target-side payload.
         """
 
+        self._hmb_registered_image_shot_source = None
         from _hmb_connection_management import target_has_suspended_role
         if target_has_suspended_role(self):
             # Managed detach retains authored source inputs across cold replay.
@@ -11294,6 +11373,25 @@ class HMBPromptLibrary(DataNode):
         )
         self._hmb_sound_connected = SOUND_INPUT_PARAMETER_NAME in incoming_by_target
         self._hmb_connected_source_nodes = {}
+        image_ports = {
+            SHOT_ASSET_INPUT_PARAMETER_NAME: "SHOT_ASSET_OUT",
+            IMAGE_ASSET_INPUT_PARAMETER_NAME: "IMAGE_ASSET_OUT",
+        }
+        image_routes = [edge for port, edge in incoming_by_target.items() if port in image_ports]
+        if image_routes:
+            from _hmb_shot_routing import _same_flow_nodes
+            _, registered = _same_flow_nodes(self)
+            source_name = image_routes[0].source_node_name
+            source = next((item for item in registered if getattr(item, "name", None) == source_name), None)
+            metadata = getattr(source, "metadata", {})
+            if (source is not None and isinstance(metadata, dict)
+                    and metadata.get("library") == "HMB_GP_Production"
+                    and metadata.get("node_type") == "HMBImageAssetLibrary"
+                    and GriptapeNodes.NodeManager().get_node_by_name(source_name) is source
+                    and all(edge.source_node_name == source_name
+                            and edge.source_parameter_name == image_ports[edge.target_parameter_name]
+                            for edge in image_routes)):
+                self._hmb_registered_image_shot_source = source
         sentinel = object()
         parent_setter = getattr(super(), "set_parameter_value", None)
         if not callable(parent_setter):
@@ -11384,6 +11482,7 @@ class HMBPromptLibrary(DataNode):
 
         self._hmb_picker_route_hydration_pending = False
         self._hmb_validated_route_content = {}
+        self._hmb_verified_image_execution_key = ""
         normalized = state if already_normalized else _normalize_state(state)
         sources = getattr(self, "_hmb_connected_source_nodes", {})
         legacy_image_source_selected = False
@@ -11522,9 +11621,8 @@ class HMBPromptLibrary(DataNode):
                 and current_shot["shot_uuid"]
                 and selected_uuid_exists
             ):
-                # A verified publisher supplies choices, not an activation.
-                # Restore the independent rows and keep Only selected until the
-                # user explicitly chooses one of those backend-owned UUIDs.
+                # Keep unbound authoring available while the legacy selector
+                # waits for an exact UUID from its connected ImageAsset.
                 normalized = _apply_image_asset_payload(
                     normalized, {}, connected=False
                 )
@@ -11619,6 +11717,7 @@ class HMBPromptLibrary(DataNode):
                     image_snapshot, selected_shot["selected_source_uids"]
                 )
                 normalized["image_asset"] = image_asset
+                self._hmb_verified_image_execution_key = _prompt_document_key(selected_shot)
                 current_shot = selected_shot
                 expected_channel = selected_shot["channel_uuid"]
 
@@ -11835,6 +11934,37 @@ class HMBPromptLibrary(DataNode):
             "shot_number": shot["number"],
             "shot_name": shot["name"],
         }
+
+    def _hmb_has_verified_execution_shot(self, state: Dict[str, Any]) -> bool:
+        sources = self._hmb_connected_source_nodes
+        source = sources.get(SHOT_ASSET_INPUT_PARAMETER_NAME) or sources.get(IMAGE_ASSET_INPUT_PARAMETER_NAME)
+        if (source is None or source is not getattr(self, "_hmb_registered_image_shot_source", None)
+                or getattr(source, "_hmb_node_deleted", False) is True):
+            return False
+        if getattr(self, "_hmb_validated_route_content", {}).get("image_asset", (None,))[0] != id(source):
+            return False
+        return _prompt_document_key(state.get("shot")) == getattr(self, "_hmb_verified_image_execution_key", "")
+
+    def _hmb_clear_unbound_execution_outputs(self) -> None:
+        previous = getattr(self, "_hmb_last_shot_context", {})
+        key = _prompt_document_key(previous)
+        if "/" in key:
+            self._hmb_set_prompt_completion([key], False)
+            self._hmb_invalidate_agent_stages([key])
+        self._hmb_last_prompt_output = self._hmb_last_machine_prompt_output = None
+        self._hmb_last_prompt_semantic_fingerprint = ""
+        self._hmb_last_shot_context = self._hmb_last_agent_context_pair = {}
+        self._hmb_agent_pair_local.pair = None
+        self._hmb_current_shot_images = self._hmb_last_shot_images = []
+        self._hmb_current_shot_videos = self._hmb_last_shot_videos = []
+        changed_media = []
+        for output in (SHOT_IMAGE_OUTPUT_PARAMETER_NAME, SHOT_VIDEO_OUTPUT_PARAMETER_NAME):
+            if self.parameter_output_values.get(output) != []:
+                set_output(self, output, [])
+                changed_media.append((output, []))
+        _notify_prompt_shot_media_outputs(self, changed_media)
+        if self.parameter_output_values.get("PROMPT_OUT") != "" or self._hmb_pending_prompt_notification:
+            _stage_and_notify_prompt_output(self, "")
 
     def _hmb_shot_manager_enabled(self) -> bool:
         return self._hmb_prompt_selector_state().get("multi_shot_enabled") is True
@@ -12450,6 +12580,7 @@ class HMBPromptLibrary(DataNode):
         from _hmb_analysis_delivery import active_analysis_routes
         key = f"{channel_uuid}/{shot_uuid}"
         with self._hmb_sync_lock:
+            self._reconcile_connected_source_inputs_from_graph()
             links = {shot_receiver_link(self, agent) for agent in self._hmb_connected_shot_agents()}
             routes = active_analysis_routes(self, channel_uuid, shot_uuid)
             try:
@@ -12542,6 +12673,8 @@ class HMBPromptLibrary(DataNode):
             state, images, videos, image_exact, _picker_exact = view._apply_exact_shot_routes(state)
             if not image_exact or _prompt_document_key(state.get("shot")) != _prompt_document_key(selected):
                 raise RuntimeError("Requested Prompt Shot has no exact ImageAsset publisher.")
+            if _publish_for_agent and not view._hmb_has_verified_execution_shot(state):
+                raise _ShotRoutingContractError("Connect a registered ImageAsset in this flow and select a Shot.")
             asset = state.get("image_asset", {})
             from _hmb_project import resolve_routing_project as resolve_project
             source_nodes = getattr(self, "_hmb_connected_source_nodes", {})
@@ -12573,17 +12706,21 @@ class HMBPromptLibrary(DataNode):
                 "shot_number": selected["number"], "shot_name": selected["name"]}
             reference_media = view._hmb_agent_reference_media(machine)
             owner_metadata = getattr(asset_owner, "metadata", None)
-            if (reference_media and isinstance(owner_metadata, dict) and owner_metadata.get("library") == "HMB_GP_Production"
+            required_registered_images = []
+            if (isinstance(owner_metadata, dict) and owner_metadata.get("library") == "HMB_GP_Production"
                     and owner_metadata.get("node_type") == "HMBImageAssetLibrary"):
                 # _apply_exact_shot_routes verified these selected registrations and
                 # their project-relative paths against the connected asset publisher.
-                registered_project_images = {
-                    f"@image{slot}": path for kind, slot, _uid, path, row, excluded
+                required_registered_images = [
+                    {"source_uid": uid, "token": f"@image{slot}", "source": path}
+                    for kind, slot, uid, path, row, excluded
                     in self._hmb_analysis_visual_rows(state, images, [])
                     if kind == "image" and not excluded and _verified_project_image(row)
-                }
-                if registered_project_images:
-                    reference_media["registered_project_images"] = registered_project_images
+                ]
+                if reference_media and required_registered_images:
+                    reference_media["registered_project_images"] = {
+                        row["token"]: row["source"] for row in required_registered_images
+                    }
             analysis_audio_generators = []
             generation_context = view._hmb_agent_generation_context(machine, analysis_audio_generators=analysis_audio_generators)
             document = copy.deepcopy({"schema": "hmb-prompt-shot-document", "version": 1,
@@ -12591,6 +12728,7 @@ class HMBPromptLibrary(DataNode):
                 "machine_prompt": machine, "paired_snapshot": paired, "generation": generation,
                 "fingerprint": fingerprint, "context": context, "shot_context": context,
                 "image_media": images, "video_media": videos,
+                "required_registered_images": required_registered_images,
                 "analysis_excluded_media": self._hmb_analysis_excluded_media(state, images, videos),
                 "audio_sources": copy.deepcopy(getattr(view, "_hmb_current_sound_snapshot", {})),
                 "reference_media": reference_media,
@@ -14077,23 +14215,25 @@ class HMBPromptLibrary(DataNode):
         from _hmb_shot_routing import collect_prompt_source_reads, accept_prompt_source_reads
         with collect_prompt_source_reads(self) as reads:
             if allow_picker_hydration_pending:
-                # An edit on an established wire changes the selected Shot's
-                # payload. Wire callbacks and workflow hydration unset this
-                # proof. Explicit execution always checks the graph again.
+                # Wire callbacks and workflow hydration unset the topology check.
                 if not getattr(self, "_hmb_prompt_input_topology_ready", False):
                     self._reconcile_shared_shot_edges()
                 state = self._write_dashboard_state(allow_picker_hydration_pending=True)
+                if not self._hmb_has_verified_execution_shot(state):
+                    self._hmb_clear_unbound_execution_outputs()
+                    return state
                 if any(row.get("asset_source_unavailable") for row in state["images"]):
                     return state
                 if getattr(self, "_hmb_picker_route_hydration_pending", False):
-                    # The dashboard can show verified images while Picker restores
-                    # its exact catalog. Keep the last atomic output generation
-                    # until the next source notification can verify both halves.
+                    # Wait for the same Shot's full media generation before publishing.
                     self._hmb_sync_publish_shot_media_pending |= publish_shot_media
                     return state
                 prompt, machine_prompt, fingerprint = self._compiled_prompt_pair_for_state(state)
             else:
                 state, prompt, machine_prompt, fingerprint = self._compile_current_prompt_pair()
+                if not self._hmb_has_verified_execution_shot(state):
+                    self._hmb_clear_unbound_execution_outputs()
+                    return state
         result = self._publish_compiled_prompt_state(state, prompt, machine_prompt, fingerprint,
             publish_shot_media=publish_shot_media, media_edit=allow_picker_hydration_pending)
         shot = _normalize_shot_selection(state.get("shot"))
@@ -14309,6 +14449,8 @@ class HMBPromptLibrary(DataNode):
                 current_machine,
                 current_fingerprint,
             ) = self._compile_current_prompt_pair(refresh_sources=False)
+            if not self._hmb_has_verified_execution_shot(current_state):
+                raise _ShotRoutingContractError("Connect a registered ImageAsset in this flow and select a Shot.")
             cached_visible = getattr(self, "_hmb_last_prompt_output", None)
             cached_machine = getattr(
                 self, "_hmb_last_machine_prompt_output", None
@@ -14408,6 +14550,8 @@ class HMBPromptLibrary(DataNode):
         incoming_text = str(incoming or "")
         with self._hmb_sync_lock:
             self._flush_initial_prompt_hydration()
+            if not self._hmb_has_verified_execution_shot(self._current_state()):
+                raise _ShotRoutingContractError("Connect a registered ImageAsset in this flow and select a Shot.")
             paired = getattr(self._hmb_agent_pair_local, "pair", None)
             if (
                 isinstance(paired, dict)
@@ -14705,6 +14849,8 @@ class HMBPromptLibrary(DataNode):
             state, visible, machine, fingerprint = (
                 self._compile_current_prompt_pair(refresh_sources=False)
             )
+            if not self._hmb_has_verified_execution_shot(state):
+                raise _ShotRoutingContractError("Connect a registered ImageAsset in this flow and select a Shot.")
             current_images = list(self._hmb_current_shot_images)
             current_videos = list(self._hmb_current_shot_videos)
             if raw_images != current_images or raw_videos != current_videos:
@@ -15290,8 +15436,10 @@ class HMBPromptLibrary(DataNode):
     async def aprocess(self) -> None:
         if getattr(self, "_hmb_node_deleted", False):
             return
+        self._reconcile_shared_shot_edges()
+        self._reconcile_connected_source_inputs_from_graph()
         scope = self._hmb_shot_channel_subscription()
-        if scope["enabled"]:
+        if scope["enabled"] and self._hmb_registered_image_shot_source is not None:
             channel, shot = scope["channel_uuid"], scope["shot_uuid"]
 
             def check_shot():

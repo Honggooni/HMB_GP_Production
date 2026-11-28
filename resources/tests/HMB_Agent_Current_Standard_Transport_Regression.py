@@ -43,6 +43,7 @@ from _hmb_native_agent.llm.agent_state import AgentState
 from _hmb_native_agent.llm.model_config import ModelConfig, ModelProvider
 import HMBAgentLibrary as hmb
 import HMBAnalysisAgent
+import HMBImageAssetLibrary as asset_module
 import HMBPromptLibrary as prompt_module
 import _hmb_agent_media as media
 from _hmb_bundled_policy_session import install_bundled_policy_session
@@ -65,8 +66,17 @@ class NativeTransport(unittest.TestCase):
         self.scope = engine_scope()
         self.engine = self.scope.__enter__()
         self.temporary = tempfile.TemporaryDirectory(prefix="hmb-current-native-media-")
-        self.image = Path(self.temporary.name) / "local-fixture.png"
+        server_projects = Path(self.temporary.name).resolve() / "Projects"
+        asset_root = server_projects / "FixtureShow" / "Ai_Ct_image"
+        manifest = asset_root / ".json" / asset_module.MANIFEST_NAMES[0]
+        manifest.parent.mkdir(parents=True)
+        self.image = asset_root / "shared-fixture.png"
         Image.new("RGB", (4, 3), (233, 14, 75)).save(self.image)
+        manifest.write_text(json.dumps({
+            "schema": asset_module.ASSET_MANIFEST_SCHEMA,
+            "version": asset_module.ASSET_MANIFEST_VERSION,
+            "assets": [{"path": self.image.name, "asset_id": "Fixture", "image_name": "Registered shared fixture"}],
+        }), encoding="utf-8")
         self.values = {"model_provider": "griptape_cloud", "model": VISION_MODEL_CHOICES[0],
             "agent": None, "prompt": "human view", "include_details": False,
             "additional_context": {"zero": 0, "off": False, "unset": "", "literal": LITERAL},
@@ -82,8 +92,8 @@ class NativeTransport(unittest.TestCase):
         machine_hash = hashlib.sha256(self.node._hmb_runtime_prompt.encode()).hexdigest()
         self.snapshot = {"schema": "hmb-agent-reference-media", "version": 1,
             "machine_sha256": machine_hash,
-            "images": [{"source": str(self.image), "media_token": "local-fixture-image",
-                "reference_index": 1, "role": "character", "label": "Approved local fixture"}], "videos": []}
+            "images": [{"source": str(self.image), "media_token": "shared-fixture-image",
+                "reference_index": 1, "role": "character", "label": "Registered shared fixture"}], "videos": []}
         self.source = SimpleNamespace(
             _hmb_agent_generation_context=lambda _expected: {"resolution": "480p", "generate_audio": False, "seed": 0},
             _hmb_agent_reference_media=lambda _expected: deepcopy(self.snapshot))
@@ -96,6 +106,7 @@ class NativeTransport(unittest.TestCase):
         self.final_text = FINAL
         self.structured_field = "instruction"
         self.patchers = ExitStack()
+        self.patchers.enter_context(mock.patch.object(asset_module, "_PREVIOUS_PROJECTS_ROOT", server_projects.as_posix()))
         self.patchers.enter_context(mock.patch.object(hmb._BaseAgent, "get_parameter_value",
             lambda _self, name: self.values.get(name)))
         self.patchers.enter_context(mock.patch.object(hmb._BaseAgent, "get_parameter_list_value",
@@ -313,6 +324,16 @@ class NativeTransport(unittest.TestCase):
         self.assertEqual(self.node._hmb_native_failure_code, "SHOT_IMAGE_UNAVAILABLE")
         self.assertEqual(self.captured, [])
         self.assertIn("@image2", self.node._hmb_reference_observation["unobserved_media_tokens"])
+
+    def test_private_local_image_stops_before_native_model_post(self):
+        private_image = Path(self.temporary.name) / "private-image.png"
+        private_image.write_bytes(self.image.read_bytes())
+        self.snapshot["images"][0]["source"] = str(private_image)
+        with self.assertRaisesRegex(RuntimeError, "Protected native Agent scheduler step failed"):
+            self.run_native()
+        self.assertEqual(self.node._hmb_native_failure_code, "SHOT_IMAGE_UNAVAILABLE")
+        self.assertEqual(self.captured, [])
+        self.assertFalse(ATTEMPTS)
 
     def test_untrusted_state_shape_cannot_activate_binary_transport(self):
         state = SimpleNamespace(model=ModelConfig(provider=ModelProvider.GRIPTAPE_CLOUD, model=VISION_MODEL_CHOICES[0]))

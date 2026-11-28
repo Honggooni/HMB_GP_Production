@@ -228,10 +228,30 @@ try:
         str(candidate_path.resolve()).replace("\\", "/")
     ]
 
-    # IMAGE_IMPORT_IN sources use the same passport and copy directly into one
-    # chosen existing asset folder before the manifest record is created.
-    external_source = test_root / "external_source.png"
-    external_source.write_bytes(PNG_1X1)
+    server_projects = test_root / "authorized" / "Projects"
+    source_root = server_projects / "SourceShow" / "Ai_Ct_image"
+    source_manifest = source_root / ".json" / "hmb_image_assets.json"
+    source_manifest.parent.mkdir(parents=True)
+    source_files = {name: PNG_1X1 for name in (
+        "external_source.png", "macro_character.png", "optional_role_source.png", "rollback_source.png"
+    )}
+    source_files["corrupt_source.png"] = b"this-is-not-a-decodable-image"
+    for name, payload in source_files.items():
+        (source_root / name).write_bytes(payload)
+    source_manifest.write_text(json.dumps({
+        "schema": asset_library.ASSET_MANIFEST_SCHEMA,
+        "version": asset_library.ASSET_MANIFEST_VERSION,
+        "assets": [{"path": name, "asset_id": Path(name).stem, "image_name": Path(name).stem}
+                   for name in source_files],
+    }), encoding="utf-8")
+
+    def register_import(state, request, media):
+        with patch.object(asset_library, "_PREVIOUS_PROJECTS_ROOT", server_projects.resolve().as_posix()):
+            return asset_library._apply_asset_registration(state, request, media)
+
+    # A registered server original wired through IMAGE_IMPORT_IN can be copied
+    # into the selected project's existing asset folder.
+    external_source = source_root / "external_source.png"
     imported_state, media_by_uid = asset_library._merge_import_input(
         registered_state,
         [str(external_source)],
@@ -272,7 +292,23 @@ try:
         assert not (project_root / "external_source.png").exists()
         assert manifest_path.read_bytes() == manifest_before_root_rejection
 
-    imported_registered = asset_library._apply_asset_registration(
+    for source in (test_root / "private_source.png", source_root / "unregistered_server_source.png"):
+        source.write_bytes(PNG_1X1)
+        rejected_state, rejected_media = asset_library._merge_import_input(registered_state, [str(source)])
+        rejected_asset = next(item for item in rejected_state["assets"] if item["source_kind"] == "user")
+        rejected_request = dict(import_request, request_id=f"reject-{source.stem}",
+                                asset_library_id=rejected_asset["asset_library_id"],
+                                source_uid=rejected_asset["source_uid"])
+        try:
+            register_import(rejected_state, rejected_request, rejected_media)
+        except ValueError as exc:
+            assert "서버 프로젝트에 등록된 원본" in str(exc)
+        else:
+            raise AssertionError("A private or unregistered source cannot be copied into the shared project.")
+        assert manifest_path.read_bytes() == manifest_before_root_rejection
+        assert not (project_root / "Environment" / "Background" / source.name).exists()
+
+    imported_registered = register_import(
         imported_state,
         import_request,
         media_by_uid,
@@ -364,8 +400,7 @@ try:
     # LoadImage publishes portable Griptape project macros such as {inputs}/...
     # rather than absolute paths. Registration must resolve that reference on
     # the server and still place the file directly in the selected asset folder.
-    macro_source = test_root / "macro_character.png"
-    macro_source.write_bytes(PNG_1X1)
+    macro_source = source_root / "macro_character.png"
     macro_input = SimpleNamespace(
         value="{inputs}/macro_character.png",
         name="macro_character.png",
@@ -398,7 +433,7 @@ try:
         else original_resolver(value)
     )
     try:
-        macro_registered = asset_library._apply_asset_registration(
+        macro_registered = register_import(
             macro_state,
             macro_request,
             macro_media,
@@ -442,30 +477,28 @@ try:
         "image_sub_type": "Full Appearance",
         "custom_source_type": "",
     }
-    embedded_registered = asset_library._apply_asset_registration(
-        embedded_state,
-        embedded_request,
-        embedded_media,
-    )
+    manifest_before_embedded = manifest_path.read_bytes()
+    try:
+        register_import(embedded_state, embedded_request, embedded_media)
+    except ValueError as exc:
+        assert "서버 프로젝트에 등록된 원본" in str(exc)
+    else:
+        raise AssertionError("Embedded local bytes cannot be registered as a server original.")
     embedded_copy = (
         project_root
         / "Character Appearance"
         / "Full body - full appearance"
         / "generated_frame.png"
     )
-    assert embedded_copy.read_bytes() == PNG_1X1
-    assert any(
-        item["registered"] and item["asset_id"] == "GeneratedHeroFrame"
-        for item in embedded_registered["assets"]
-    )
+    assert not embedded_copy.exists()
+    assert manifest_path.read_bytes() == manifest_before_embedded
 
     # A freshly imported image starts unclassified. The backend can preserve an
     # explicit unclassified record for compatibility, while the UI requires the
     # new Main/Sub pair before a user can submit registration.
-    optional_role_source = test_root / "optional_role_source.png"
-    optional_role_source.write_bytes(PNG_1X1)
+    optional_role_source = source_root / "optional_role_source.png"
     optional_state, optional_media = asset_library._merge_import_input(
-        embedded_registered,
+        macro_registered,
         [str(optional_role_source)],
     )
     optional_asset = next(
@@ -488,7 +521,7 @@ try:
         "image_sub_type": "",
         "custom_source_type": "",
     }
-    optional_registered = asset_library._apply_asset_registration(
+    optional_registered = register_import(
         optional_state,
         optional_request,
         optional_media,
@@ -514,8 +547,7 @@ try:
 
     # A manifest failure removes only the copied file and keeps the user's
     # existing selected asset folder intact.
-    rollback_source = test_root / "rollback_source.png"
-    rollback_source.write_bytes(PNG_1X1)
+    rollback_source = source_root / "rollback_source.png"
     rollback_state, rollback_media = asset_library._merge_import_input(
         optional_registered,
         [str(rollback_source)],
@@ -543,7 +575,7 @@ try:
                       side_effect=lambda src, dst: deny_manifest_replace(src, dst, 5)), \
          patch.object(asset_library.time, "sleep"):
         try:
-            asset_library._apply_asset_registration(
+            register_import(
                 rollback_state,
                 rollback_request,
                 rollback_media,
@@ -560,8 +592,7 @@ try:
     ).exists()
     assert (project_root / "Environment" / "Background").is_dir()
 
-    corrupt_source = test_root / "corrupt_source.png"
-    corrupt_source.write_bytes(b"this-is-not-a-decodable-image")
+    corrupt_source = source_root / "corrupt_source.png"
     corrupt_state, corrupt_media = asset_library._merge_import_input(
         optional_registered,
         [str(corrupt_source)],
@@ -585,7 +616,7 @@ try:
     }
     manifest_before_corrupt = manifest_path.read_bytes()
     try:
-        asset_library._apply_asset_registration(
+        register_import(
             corrupt_state,
             corrupt_request,
             corrupt_media,

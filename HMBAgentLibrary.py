@@ -264,6 +264,7 @@ _HMB_TOPOLOGY_UNAVAILABLE_MESSAGE = (
     "[HMB CONNECTION CHECK FAILED] Prompt 연결 상태를 안전하게 확인할 수 없어 "
     "Agent 실행을 중단했습니다. 연결 상태를 확인한 뒤 재시도하십시오."
 )
+_HMB_AGENT_SHOT_REQUIRED_MESSAGE = "ImageAsset 샷이 연결된 HMBPrompt를 선택하세요."
 class _HMBSourcePreparation:
     """Cancelable reservation, never a native Agent or a saved input value."""
 
@@ -331,6 +332,7 @@ _HMB_NATIVE_FAILURE_CODES = frozenset({
     "ANALYSIS_AUDIO_UNSUPPORTED",
     "ANALYSIS_ORIGINAL_UNAVAILABLE",
     "SHOT_IMAGE_UNAVAILABLE",
+    "SHOT_IMAGE_MODEL_UNSUPPORTED",
     "HOST_ADAPTER",
     "EMPTY_OUTPUT",
 })
@@ -386,6 +388,9 @@ def _hmb_execution_failure_message(code: str, *, stage: str = "") -> str:
         ),
         "SHOT_IMAGE_UNAVAILABLE": (
             "선택한 샷의 이미지를 모두 첨부하지 못했습니다. 참조 이미지 확인 결과에서 해당 이미지의 경로와 읽기 상태를 확인하세요."
+        ),
+        "SHOT_IMAGE_MODEL_UNSUPPORTED": (
+            "등록 이미지를 전달하려면 이미지 입력을 지원하는 Griptape Cloud 모델을 선택하세요."
         ),
         "HOST_ADAPTER": "The native Agent or model adapter could not complete execution.",
         "EMPTY_OUTPUT": "The Agent model returned no final text.",
@@ -1226,6 +1231,89 @@ class _FrozenHMBPromptShotSource:
 def _is_prompt_shot_manager(source):
     enabled = getattr(source, "_hmb_shot_manager_enabled", None)
     return callable(enabled) and enabled() is True
+
+
+def _hmb_required_registered_images(source, machine, scope):
+    """Read required rows independently of the optional visual media packet."""
+    document = None
+    if isinstance(source, _FrozenHMBPromptShotSource):
+        document, owner = source._document, source._owner
+    elif isinstance(source, _HMBAgentShotSource):
+        document, owner = source.document, source.owner
+    else:
+        owner = source
+    metadata = getattr(owner, "metadata", {})
+    live_prompt = (isinstance(metadata, dict) and metadata.get("library") == "HMB_GP_Production"
+                   and metadata.get("node_type") == "HMBPromptLibrary")
+    if document is None and live_prompt and scope.get("enabled"):
+        # Compatibility for an exact, single-Shot Prompt that is not a manager.
+        document = owner._hmb_prompt_shot_document(channel_uuid=scope["channel_uuid"], shot_uuid=scope["shot_uuid"])
+    if document is None:
+        return None
+    if not isinstance(document, dict) or document.get("machine_prompt") != machine:
+        raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+    if "required_registered_images" not in document and not live_prompt:
+        return None
+    rows = document.get("required_registered_images")
+    if not isinstance(rows, list):
+        raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+    from _hmb_agent_media import MAX_PROJECT_IMAGE_ATTACHMENTS
+
+    shot = document.get("shot")
+    selected = shot.get("selected_source_uids") if isinstance(shot, dict) else None
+    originals = document.get("image_media")
+    if live_prompt and (not isinstance(selected, list) or not isinstance(originals, list) or len(selected) != len(originals)):
+        raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+    if live_prompt:
+        exclusions = document.get("analysis_excluded_media") or {}
+        excluded = exclusions.get("images", []) if isinstance(exclusions, dict) else None
+        if (not isinstance(excluded, list) or any(not isinstance(path, str) for path in excluded)
+                or any(not isinstance(uid, str) or not uid for uid in selected)
+                or any(not isinstance(path, str) or not path for path in originals)):
+            raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+        required_uids = {uid for uid, path in zip(selected, originals)
+                         if uid.startswith("project:") and path not in excluded}
+        supplied_uids = {row.get("source_uid") for row in rows
+                         if isinstance(row, dict) and isinstance(row.get("source_uid"), str)}
+        if supplied_uids != required_uids:
+            raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+    previous_slot = 0
+    for row in rows:
+        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key]
+                                           for key in ("source_uid", "token", "source")):
+            raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+        match = re.fullmatch(r"@image([1-9][0-9]?)", row["token"])
+        slot = int(match.group(1)) if match else 0
+        if (not previous_slot < slot <= MAX_PROJECT_IMAGE_ATTACHMENTS
+                or (selected is not None and (slot > len(selected) or selected[slot - 1] != row["source_uid"]))
+                or (originals is not None and (slot > len(originals) or originals[slot - 1] != row["source"]))):
+            raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+        previous_slot = slot
+    if len({row["source_uid"] for row in rows}) != len(rows):
+        raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+    return rows
+
+
+def _hmb_registered_images_match_media(required, media):
+    tokens = {row["token"] for row in required}
+    rows = media.get("images")
+    if not isinstance(rows, list):
+        return False
+    actual = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("token"), str):
+            return False
+        identity = row.get("identity")
+        project = (isinstance(identity, dict) and identity.get("verified") is True
+                   and identity.get("source_kind") == "project")
+        if row["token"] in tokens or project:
+            if not project:
+                return False
+            position = identity.get("selection_order")
+            if position is not None and (type(position) is not int or row["token"] != f"@image{position}"):
+                return False
+            actual.append({"source_uid": identity.get("source_uid"), "token": row["token"], "source": row.get("source")})
+    return actual == required
 
 
 def _prompt_transport_text(prompt_value: Any) -> str:
@@ -2541,7 +2629,14 @@ class HMBAgentLibrary(_BaseAgent):
                 or getattr(self, "_hmb_manual_rebind", {}).get("required")
                 or not _parameter_exists(self, _AGENT_SHOT_STORE_PARAMETER)):
             return
-        self._hmb_shot_slots[self._hmb_active_slot_key] = self._hmb_native_slot_snapshot()
+        key = self._hmb_active_slot_key
+        snapshot = self._hmb_native_slot_snapshot()
+        if key == "__hmb_only__" and snapshot["result"].get("message") == _HMB_AGENT_SHOT_REQUIRED_MESSAGE:
+            previous = self._hmb_shot_slots.get(key, {})
+            # Waiting is transient; retain the previously saved result.
+            snapshot["outputs"] = copy.deepcopy(previous.get("outputs", {}))
+            snapshot["result"] = copy.deepcopy(previous.get("result", {}))
+        self._hmb_shot_slots[key] = snapshot
         self._hmb_request_shot_store_persist()
 
     def _hmb_switch_native_slot(self, channel_uuid="", shot_uuid=""):
@@ -3204,6 +3299,8 @@ class HMBAgentLibrary(_BaseAgent):
             # retain their separate Generator request identity.
             payload = {k: document.get(k) for k in ("subscription", "visible_prompt", "machine_prompt",
                 "reference_media", "image_media", "video_media", "analysis_excluded_media", "project_identity")}
+            if "required_registered_images" in document:
+                payload["required_registered_images"] = document["required_registered_images"]
             payload.update(native=self._hmb_authored_model_settings(slot), policy=policy, contents=contents,
                            sound={k: v for k, v in audio.items() if k != "revision"},
                            analysis=analysis, originals=originals)
@@ -4173,7 +4270,8 @@ class HMBAgentLibrary(_BaseAgent):
                    and result.get("inference_started") is False and result.get("policy_applied") is False)
         slot = getattr(self, "_hmb_shot_slots", {}).get(getattr(self, "_hmb_active_slot_key", ""))
         publication_warning = bool(slot.get("publication_warnings")) if isinstance(slot, dict) else False
-        for name, visible in ((_AGENT_EXECUTION_FAILED_WARNING, result.get("status") == "failed"),
+        failed = result.get("status") == "failed" and result.get("message") != _HMB_AGENT_SHOT_REQUIRED_MESSAGE
+        for name, visible in ((_AGENT_EXECUTION_FAILED_WARNING, failed),
                               (_AGENT_CREATED_WARNING, created),
                               (_AGENT_PUBLICATION_WARNING, publication_warning),
                               (_AGENT_PROJECT_POLICY_ABSENT_WARNING, result.get("policy_status") == "absent")):
@@ -4486,18 +4584,34 @@ class HMBAgentLibrary(_BaseAgent):
             self._hmb_capture_active_slot()
             self._refresh_agent_shot_route(strict=True)
             selected = self._hmb_shot_channel_subscription()
-            if selected.get("enabled"):
-                scope = {name: selected[name] for name in ("channel_uuid", "shot_uuid")}
-                owner = self._hmb_manager_prompt_owner(**scope)
-                await self._hmb_prepare_shot_document(**scope, prompt_owner=owner,
-                    lifecycle_generation=self._hmb_lifecycle_generation)
+            if not selected.get("enabled"):
+                self._hmb_wait_for_shot_connection()
+                return
+            scope = {name: selected[name] for name in ("channel_uuid", "shot_uuid")}
+            owner = self._hmb_manager_prompt_owner(**scope)
+            await self._hmb_prepare_shot_document(**scope, prompt_owner=owner,
+                lifecycle_generation=self._hmb_lifecycle_generation)
             return
         gate = await _acquire_agent_execution_gate(self)
         try:
+            if not self._hmb_shot_channel_subscription().get("enabled"):
+                self._refresh_agent_shot_route(strict=True)
+                if not self._hmb_shot_channel_subscription().get("enabled"):
+                    self._hmb_wait_for_shot_connection()
+                    return
             await self._hmb_aprocess_locked()
             self._hmb_capture_active_slot()
         finally:
             gate.release()
+
+    def _hmb_wait_for_shot_connection(self) -> None:
+        self._hmb_capture_active_slot()
+        self._publish_hmb_execution_block("")
+        self._hmb_native_inference_started = False
+        self._hmb_run_policy_applied = self._hmb_run_policy_omitted = False
+        self._hmb_run_project_identity = {}
+        self._hmb_reference_observation = {}
+        self._set_hmb_execution_result("failed", code="SOURCE_UNAVAILABLE", message=_HMB_AGENT_SHOT_REQUIRED_MESSAGE)
 
     async def _hmb_aprocess_locked(self) -> None:
         """Handle this Agent's failure without canceling independent host tasks.
@@ -4556,6 +4670,8 @@ class HMBAgentLibrary(_BaseAgent):
             return
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return
+        if self._hmb_execution_result.get("status") == "failed":
+            return
         if (getattr(self, "_hmb_native_run_completed", False)
                 and not getattr(self, "_hmb_native_inference_started", False)):
             # Standard Agent completes its empty-prompt branch by constructing
@@ -4583,10 +4699,9 @@ class HMBAgentLibrary(_BaseAgent):
     def _ensure_hmb_shot_prompt_input(self) -> None:
         """Register the private, router-owned Prompt dependency port.
 
-        The built-in public ``prompt`` parameter stays untouched so an Agent
-        without a routed Shot is byte-for-byte the Standard Agent path. Runtime
-        values on this hidden port are never serialized; hydration recreates
-        only the graph edge from authoritative Shot identity.
+        The public ``prompt`` field preserves saved authoring. Values on this
+        execution port are never serialized; hydration recreates the graph
+        edge from the authoritative Shot identity.
         """
 
         try:
@@ -4780,7 +4895,7 @@ class HMBAgentLibrary(_BaseAgent):
                 "channel_uuid": "",
                 "shot_uuid": "",
                 "shot_number": 1,
-                "shot_name": "Only",
+                "shot_name": "",
             }
         execution_binding = self._normalize_execution_shot_binding(
             getattr(self, "_hmb_execution_shot_binding", {})
@@ -4843,7 +4958,7 @@ class HMBAgentLibrary(_BaseAgent):
                 ).split()
             )[:128]
             if bound
-            else "Only"
+            else ""
         )
         return {
             "schema": "hmb-shot-channel-subscription",
@@ -4853,14 +4968,14 @@ class HMBAgentLibrary(_BaseAgent):
             "channel_uuid": channel_uuid if bound else "",
             "shot_uuid": shot_uuid if bound else "",
             "shot_number": number if bound else 1,
-            "shot_name": name if bound else "Only",
+            "shot_name": name,
         }
 
     @hmb_binding_mutation
     def _hmb_clear_shot_routing_catalog(
         self, reason: str = "publisher_unavailable"
     ) -> dict[str, Any]:
-        """Return to independent Only mode without touching native Agent output."""
+        """Wait for a registered Shot while preserving saved Agent results."""
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
@@ -5210,14 +5325,12 @@ class HMBAgentLibrary(_BaseAgent):
                 self._hmb_initial_shot_autoclaim_pending = False
                 self._hmb_initial_shot_preferred_uuid = ""
         else:
-            # A catalog is an option source only. Blank recipients stay Only,
-            # and deletion of the active UUID safely returns to Only while the
-            # renumbered remote choices remain visible.
+            # Leave the recipient unbound while showing the remaining choices.
             shot = {
                 "channel_uuid": "",
                 "shot_uuid": "",
                 "number": 1,
-                "name": "Only",
+                "name": "",
             }
         try:
             parameter = _parameter_by_name(self, _AGENT_WIDGET_PARAMETER)
@@ -5413,11 +5526,7 @@ class HMBAgentLibrary(_BaseAgent):
             "shot_name",
         )
         if not isinstance(source_subscription, dict):
-            # Compatibility with Prompt-only policy tests/older Prompt nodes is
-            # allowed only while this Agent is also in independent Only mode.
-            if subscription.get("enabled"):
-                raise RuntimeError("HMB Prompt Shot identity is unavailable.")
-            return {}
+            raise RuntimeError("HMB Prompt Shot identity is unavailable.")
         if source_subscription.get("participant_kind") != "prompt":
             raise RuntimeError("HMB Prompt Shot identity is invalid.")
         source_enabled = bool(source_subscription.get("enabled"))
@@ -5425,7 +5534,7 @@ class HMBAgentLibrary(_BaseAgent):
         if source_enabled != agent_enabled:
             raise RuntimeError("HMB Prompt and Agent Shot identities do not match.")
         if not agent_enabled:
-            return {}
+            raise RuntimeError("HMB Agent requires an ImageAsset-managed Shot.")
         verified_subscription = HMBAgentLibrary._normalize_execution_shot_binding(
             subscription
         )
@@ -5833,7 +5942,7 @@ class HMBAgentLibrary(_BaseAgent):
                     "channel_uuid": current.get("channel_uuid", ""),
                     "shot_uuid": current.get("shot_uuid", ""),
                     "number": current.get("shot_number", 1),
-                    "name": current.get("shot_name", "Only"),
+                    "name": current.get("shot_name", ""),
                 }
             requested_manager = True
             if requested_manager:
@@ -5901,7 +6010,7 @@ class HMBAgentLibrary(_BaseAgent):
                     "channel_uuid": current.get("channel_uuid", ""),
                     "shot_uuid": current.get("shot_uuid", ""),
                     "number": current.get("shot_number", 1),
-                    "name": current.get("shot_name", "Only"),
+                    "name": current.get("shot_name", ""),
                 }
             requested_manager = True
             if requested_manager:
@@ -6563,10 +6672,11 @@ class HMBAgentLibrary(_BaseAgent):
                 self.show_message_by_name(warning_name)
             except Exception:
                 pass
-        try:
-            print(f"[HMB_PRODUCTION][ERROR] {message}")
-        except Exception:
-            pass
+        if message:
+            try:
+                print(f"[HMB_PRODUCTION][ERROR] {message}")
+            except Exception:
+                pass
         try:
             self._refresh_agent_shot_route()
         except Exception:
@@ -6849,9 +6959,13 @@ class HMBAgentLibrary(_BaseAgent):
                 except Exception:
                     pass
             media_getter = getattr(source, "_hmb_agent_reference_media", None)
+            required_images = None if web_revision else _hmb_required_registered_images(source, machine, scope)
+            registered_tokens = [row["token"] for row in required_images or ()]
             analysis_media_issue = ("ANALYSIS_ORIGINAL_UNAVAILABLE"
                                     if opted_originals and not callable(media_getter) else "")
-            required_shot_images = set()
+            if registered_tokens and not callable(media_getter):
+                raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+            legacy_required_images = set()
             observation = {}
             if callable(media_getter):
                 try:
@@ -6868,16 +6982,24 @@ class HMBAgentLibrary(_BaseAgent):
                         and media.get("schema") == "hmb-agent-reference-media"
                         and media.get("version") == 1
                     )
+                    if registered_tokens and not valid_media:
+                        raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
                     if opted_originals and not valid_media:
                         analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
                     if valid_media:
                         project_images = {}
-                        if isinstance(source, (_FrozenHMBPromptShotSource, _HMBAgentShotSource)):
+                        if required_images is not None:
+                            if not _hmb_registered_images_match_media(required_images, media):
+                                raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
+                            if registered_tokens and not driver_accepts_images(agent):
+                                raise _HMBAnalysisOriginalError("SHOT_IMAGE_MODEL_UNSUPPORTED")
+                            project_images = {row["token"]: row["source"] for row in required_images}
+                        elif isinstance(source, (_FrozenHMBPromptShotSource, _HMBAgentShotSource)):
                             project_images = media.get("registered_project_images", {})
-                        shot_images = media.get("images", [])
-                        if project_images and len(shot_images) <= MAX_PROJECT_IMAGE_ATTACHMENTS and driver_accepts_images(agent):
-                            required_shot_images.update(project_images)
-                            required_shot_images.update(row["token"] for row in shot_images if row.get("token"))
+                            shot_images = media.get("images", [])
+                            if project_images and len(shot_images) <= MAX_PROJECT_IMAGE_ATTACHMENTS and driver_accepts_images(agent):
+                                legacy_required_images.update(project_images)
+                                legacy_required_images.update(row["token"] for row in shot_images if row.get("token"))
                         if (sw_direction and machine_only and not analysis and not opted_originals
                                 and not sound_tracks
                                 and getattr(agent, "messages", None) == [] and getattr(agent, "tools", None) == []
@@ -6913,20 +7035,29 @@ class HMBAgentLibrary(_BaseAgent):
                         prompt = augment_prompt(
                             prompt, media, agent,
                             registered_project_images=project_images,
+                            require_shared_images=True,
                             is_live=lambda: self._hmb_lifecycle_is_live(lifecycle_generation)
                             and not bool(getattr(self, "is_cancellation_requested", False)),
                             report_sink=_record_media_report,
                         )
+                        if any(item.get("reason") == "source_missing" for item in observation.get("skips", [])):
+                            raise _HMBAnalysisOriginalError("SHOT_IMAGE_UNAVAILABLE")
                         if required_tokens and not analysis_media_issue:
                             delivered = {row.get("media_token") for row in observation.get("coverage", [])}
                             if required_tokens - delivered:
                                 analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
+                except _HMBAnalysisOriginalError:
+                    raise
                 except Exception:
                     if opted_originals and not analysis_media_issue:
                         analysis_media_issue = "ANALYSIS_ORIGINAL_UNAVAILABLE"
-            if required_shot_images and not analysis_media_issue and not self.is_cancellation_requested:
-                prepared = {row.get("media_token") for row in observation.get("coverage", [])}
-                if required_shot_images - prepared:
+            if (registered_tokens or legacy_required_images) and not analysis_media_issue and not self.is_cancellation_requested:
+                coverage = observation.get("coverage", [])
+                if registered_tokens:
+                    from _hmb_agent_media import native_has_registered_images
+                    if not native_has_registered_images(prompt, registered_tokens, coverage):
+                        analysis_media_issue = "SHOT_IMAGE_UNAVAILABLE"
+                elif legacy_required_images - {row.get("media_token") for row in coverage}:
                     analysis_media_issue = "SHOT_IMAGE_UNAVAILABLE"
             if analysis_media_issue:
                 raise _HMBAnalysisOriginalError(analysis_media_issue)
@@ -7178,19 +7309,7 @@ class HMBAgentLibrary(_BaseAgent):
             return False
 
     def process(self):
-        """Execute the native Agent exactly once.
-
-        A plain/native prompt is a stock Standard Library Agent execution: the
-        sealed HMB policy is not read, injected, filtered, or used to rewrite its
-        output.  Only the direct registered
-        ``HMBPromptLibrary.PROMPT_OUT -> HMBAgentLibrary.SHOT_PROMPT_IN`` edge opts into
-        the available four project rules plus four shot rules. The Prompt owns all four
-        valid source modes (Prompt only, +Asset, +Picker, +Asset+Picker), so the
-        Agent does not infer its siblings from payload text. Once that canonical
-        edge is present, missing project rules are reported and the verified
-        source still runs. Present invalid policy and source verification
-        failures are reported before native execution.
-        """
+        """Run the native Agent for a verified, registered Prompt Shot."""
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return None
         origin = getattr(self, "_hmb_timing_origin", None)
@@ -7225,30 +7344,19 @@ class HMBAgentLibrary(_BaseAgent):
         # The selector is cable-free in the editor, but the router establishes
         # the same-flow hidden Prompt edge before topology validation so the
         # native scheduler still observes the real dependency.
-        # Topology is the contract.  HMBPromptLibrary owns its four valid modes
-        # (Prompt only, +Asset, +Picker, +Asset+Picker), so headings or payload
-        # wording may evolve without silently disabling its parent Agent path.
         try:
             self._refresh_agent_shot_route(strict=True)
             if not self._hmb_lifecycle_is_live(lifecycle_generation):
                 return None
-            is_hmb = self._has_canonical_hmb_prompt_connection()
-            self._hmb_run_hmb_source = bool(is_hmb)
+            if not self._hmb_shot_channel_subscription().get("enabled"):
+                self._hmb_wait_for_shot_connection()
+                return None
+            if not self._has_canonical_hmb_prompt_connection():
+                raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
+            self._hmb_run_hmb_source = True
         except Exception:
             self._publish_hmb_execution_block(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE)
             raise RuntimeError(_HMB_TOPOLOGY_UNAVAILABLE_MESSAGE) from None
-
-        # No canonical HMB Prompt edge means no HMB policy work at all. Asset,
-        # Picker, copied HMB-shaped text, and every ordinary Prompt stay on the
-        # Standard Library execution path.
-        if not is_hmb:
-            self._clear_hmb_runtime_policy()
-            self._hide_hmb_policy_warning()
-            self._set_hmb_execution_stage("native_prepare")
-            try:
-                return (yield from self._run_native_agent_once())
-            finally:
-                self._set_hmb_execution_stage("complete")
 
         if not self._hmb_lifecycle_is_live(lifecycle_generation):
             return None

@@ -1241,7 +1241,15 @@ class HMBAnalysisAgent(DataNode):
                     range_arguments = {"time_ranges": slot["time_ranges"]}
                 else:
                     range_arguments = {"start": slot["start"], "end": slot["end"]}
-                result = await asyncio.to_thread(analyze_reference, self, source=source["path"],
+                source_path = source["path"]
+                if slot["kind"] == "image":
+                    from HMBImageAssetLibrary import require_registered_shared_image
+
+                    try:
+                        source_path = str(await asyncio.to_thread(require_registered_shared_image, source_path))
+                    except ValueError as exc:
+                        raise AnalysisError("ANALYSIS_SOURCE_MISSING", str(exc)) from exc
+                result = await asyncio.to_thread(analyze_reference, self, source=source_path,
                     kind=slot["kind"], **range_arguments,
                     model=model, model_config=model_config, guidance=slot["guidance"], is_live=lambda: not token.is_set(),
                     analysis_context={"channel_uuid": channel, "shot_uuid": shot}, force_refresh=reanalyze)

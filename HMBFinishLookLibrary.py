@@ -484,6 +484,7 @@ def validate_widget_state(value: Any) -> dict[str, Any]:
     allowed = required | {
         "catalog",  # Discard the obsolete catalog during legacy hydration.
         "shot_catalog",
+        "shot_catalog_live",  # Discard the widget's presentation-only connection hint.
         "shot",
         "shot_manager", "shot_editor_expanded", "shot_documents", "shot_edit_locks", "verified_shots", UI_TRANSPORT_KEY,
     }
@@ -739,7 +740,7 @@ class HMBFinishLookLibrary(DataNode):
                 "dict",
                 "Hidden same-Shot Finish Look dependency for HMBSeedanceGeneration.",
             ),
-            (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, default_finish_look_state(), "dict", "Canonical schema_version 2 Beauty-only state."),
+            (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, {}, "dict", "Canonical schema_version 2 Beauty-only state."),
             (REMOTE_STATUS_OUTPUT_PARAMETER_NAME, copy.deepcopy(DEFAULT_REMOTE_STATUS), "dict", "Latest strict remote patch result."),
         )
         for name, default, type_name, tooltip in outputs:
@@ -842,7 +843,7 @@ class HMBFinishLookLibrary(DataNode):
         state: Mapping[str, Any],
     ) -> bool:
         subscription = self._hmb_shot_channel_subscription()
-        if not subscription.get("enabled"):
+        if not self._hmb_finish_has_managed_shot(subscription["channel_uuid"], subscription["shot_uuid"]):
             changed = bool(self._hmb_finish_snapshot)
             self._hmb_finish_snapshot = {}
             self._hmb_finish_snapshot_fingerprint = ""
@@ -890,12 +891,15 @@ class HMBFinishLookLibrary(DataNode):
         }
         return changed
 
-    def _publish_all(self, *, live: bool) -> None:
+    def _publish_all(self, *, live: bool, persist: bool = True) -> None:
         with self._state_lock:
             state = copy.deepcopy(self._last_valid_state)
-            prompt = compile_finish_look_prompt(state)
+            shot = self._widget_state["shot"]
+            bound = self._hmb_finish_has_managed_shot(shot["channel_uuid"], shot["shot_uuid"])
+            prompt = compile_finish_look_prompt(state) if bound else ""
             self._update_finish_snapshot_locked(prompt, state)
-            self._hmb_finish_persist_store()
+            if persist:
+                self._hmb_finish_persist_store()
             shot_snapshot = copy.deepcopy(self._hmb_finish_snapshot)
             shot_fingerprint = self._hmb_finish_snapshot_fingerprint
             publish_shot_snapshot = (
@@ -910,7 +914,7 @@ class HMBFinishLookLibrary(DataNode):
             # publication can wake a consumer. A reentrant newer publication
             # invalidates this owner's remaining work.
             values = (
-                (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, state),
+                (FINISH_LOOK_STATE_OUTPUT_PARAMETER_NAME, state if bound else {}),
                 (FINISH_LOOK_OUTPUT_PARAMETER_NAME, prompt),
                 (SHOT_FINISH_LOOK_OUTPUT_PARAMETER_NAME, shot_snapshot),
                 (REMOTE_STATUS_OUTPUT_PARAMETER_NAME, remote_status),
@@ -978,7 +982,6 @@ class HMBFinishLookLibrary(DataNode):
         catalog = self._widget_state.get("shot_catalog") or {}
         identities = {self._hmb_finish_key(catalog.get("channel_uuid"), row["shot_uuid"]): row
             for row in catalog.get("shots", [])}
-        identities["__standalone__"] = _shot_only()
         targets = {key: _canonical_sha256({"finish_look": (documents.get(key) or {}).get("finish_look", default_finish_look_state()),
             "remote_revision": (documents.get(key) or {}).get("remote_revision", 0),
             "identity": identity, "remote_connected": self._remote_connected}) for key, identity in identities.items()}
@@ -993,6 +996,7 @@ class HMBFinishLookLibrary(DataNode):
             self._hmb_finish_ui_ack = {}
         return {"schema": UI_TRANSPORT_SCHEMA, "version": 1, "session_id": self._hmb_finish_ui_session,
             "revision": self._hmb_finish_ui_revision, "target_revisions": dict(self._hmb_finish_ui_target_revisions),
+            "shot_catalog_live": bool(self._hmb_shot_catalog_snapshot),
             "status": "state", "client_id": "", "client_epoch": "", "request_id": "", "sequence": 0, **self._hmb_finish_ui_ack}
 
     def _hmb_finish_ui_reply(self, command, status):
@@ -1037,10 +1041,15 @@ class HMBFinishLookLibrary(DataNode):
             self._hmb_finish_ui_clients[command["client_id"]] = {**{key: command[key] for key in ("sequence", "request_id")}, "client_epoch": previous["client_epoch"]}
             if operation == "refresh":
                 self._hmb_finish_ui_reply(command, "refreshed");return
-            catalog = self._hmb_available_finish_shot_catalog(self._hmb_shot_catalog_snapshot, self._widget_state.get("shot")) or self._widget_state.get("shot_catalog") or {}
+            catalog = self._hmb_available_finish_shot_catalog(self._hmb_shot_catalog_snapshot, self._widget_state.get("shot")) or {}
             requested = _normalize_shot_selection(normalized.get("shot"), catalog)
             key = self._hmb_finish_key(requested["channel_uuid"], requested["shot_uuid"])
-            if key not in clock["target_revisions"] or (catalog.get("shots") and not requested["shot_uuid"]):
+            if key not in clock["target_revisions"] or not self._hmb_finish_has_managed_shot(requested["channel_uuid"], requested["shot_uuid"]):
+                if (operation == "edit" and normalized["language"] != self._widget_state["language"]
+                        and normalized["finish_look"] == self._last_valid_state):
+                    self._widget_state["language"] = normalized["language"]
+                    self._hmb_finish_ui_reply(command, "accepted")
+                    return
                 self._hmb_finish_ui_reply(command, "target_unavailable");return
             if operation == "select":
                 selection = copy.deepcopy(self._widget_state)
@@ -1080,10 +1089,16 @@ class HMBFinishLookLibrary(DataNode):
     def _hmb_shot_manager_enabled(self):
         return not bool(getattr(self, "_hmb_finish_legacy_mode", False))
 
+    def _hmb_finish_has_managed_shot(self, channel_uuid, shot_uuid):
+        catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
+        return bool(not self._node_deleted and not getattr(self, "_hmb_node_deleted", False)
+                    and channel_uuid and shot_uuid and channel_uuid == catalog.get("channel_uuid")
+                    and any(row["shot_uuid"] == shot_uuid for row in catalog.get("shots", ())))
+
     def _hmb_shot_manager_subscriptions(self):
         if not self._hmb_shot_manager_enabled():
             value = self._hmb_shot_channel_subscription()
-            return [value] if value.get("enabled") else []
+            return [value] if self._hmb_finish_has_managed_shot(value["channel_uuid"], value["shot_uuid"]) else []
         catalog = getattr(self, "_hmb_shot_catalog_snapshot", {})
         return [{"schema": SHOT_SUBSCRIPTION_SCHEMA, "version": 1, "participant_kind": "finish_look",
             "enabled": True, "channel_uuid": catalog["channel_uuid"], "shot_uuid": row["shot_uuid"],
@@ -1554,7 +1569,7 @@ class HMBFinishLookLibrary(DataNode):
         self._publish_all(live=False)
         self._hmb_shot_route_status = {
             "ok": True,
-            "code": "catalog_ready" if shot["shot_uuid"] else "only",
+            "code": "catalog_ready" if shot["shot_uuid"] else "waiting_for_managed_shot",
         }
 
     @hmb_binding_mutation
@@ -1562,7 +1577,7 @@ class HMBFinishLookLibrary(DataNode):
         self,
         reason: str = "publisher_unavailable",
     ) -> dict[str, Any]:
-        """Return to Only while retaining authored Character Beauty values."""
+        """Clear the live route while retaining authored Character Beauty values."""
 
         if bool(getattr(self, "_hmb_node_deleted", False)):
             return self._hmb_shot_channel_subscription()
@@ -1576,7 +1591,7 @@ class HMBFinishLookLibrary(DataNode):
             self._hmb_initial_shot_autoclaim_pending = False
             self._hmb_initial_shot_preferred_uuid = ""
             self._restore_widget_parameter(live=True)
-        self._publish_all(live=False)
+        self._publish_all(live=True)
         self._hmb_shot_route_status = {
             "ok": False,
             "code": str(reason or "publisher_unavailable")[:128],
@@ -1641,6 +1656,9 @@ class HMBFinishLookLibrary(DataNode):
         """Return a validated atomic Finish Look snapshot for Seedance."""
 
         with self._state_lock:
+            shot = self._widget_state["shot"]
+            if not self._hmb_finish_has_managed_shot(shot["channel_uuid"], shot["shot_uuid"]):
+                raise RuntimeError("ImageAsset의 샷을 연결하세요.")
             state = validate_finish_look_state(self._last_valid_state)
             prompt = compile_finish_look_prompt(state)
             self._update_finish_snapshot_locked(prompt, state)
@@ -1720,7 +1738,8 @@ class HMBFinishLookLibrary(DataNode):
     def _hmb_publish_routed_finish_snapshot(self, *, force: bool = False) -> bool:
         """Publish once after the router has attached the exact Seedance edge."""
 
-        if not self._hmb_shot_channel_subscription().get("enabled"):
+        subscription = self._hmb_shot_channel_subscription()
+        if not self._hmb_finish_has_managed_shot(subscription["channel_uuid"], subscription["shot_uuid"]):
             with self._state_lock:
                 self._hmb_finish_route_ready = False
             return False
@@ -1794,11 +1813,15 @@ class HMBFinishLookLibrary(DataNode):
             # Before the first live catalog arrives, retain a serialized
             # catalog long enough for UUID-based hydration. Once routing owns
             # a catalog, browser state can never replace it.
-            effective_catalog = authoritative_catalog or normalized["shot_catalog"]
+            effective_catalog = authoritative_catalog or (normalized["shot_catalog"] if self._hmb_finish_hydrating else {})
             requested_shot = _normalize_shot_selection(
                 normalized.get("shot"),
                 effective_catalog,
             )
+            if not self._hmb_finish_hydrating and not self._hmb_finish_has_managed_shot(requested_shot["channel_uuid"], requested_shot["shot_uuid"]):
+                self._widget_state["language"] = normalized["language"]
+                self._restore_widget_parameter(live=True)
+                return
             shot_changed = requested_shot != previous_shot
             saved_initial_authoring = self._hmb_finish_hydrating and not self._hmb_finish_loaded_store
             if shot_changed and self._hmb_shot_manager_enabled() and not saved_initial_authoring:
@@ -1868,6 +1891,12 @@ class HMBFinishLookLibrary(DataNode):
             normalized_request = normalize_remote_request(value)
             request_id = normalized_request["request_id"]
             with self._state_lock:
+                shot = self._widget_state["shot"]
+                if not self._hmb_finish_has_managed_shot(shot["channel_uuid"], shot["shot_uuid"]):
+                    self._remote_status = {"schema_version": 1, "status": "rejected", "code": "shot_context_required",
+                        "message": "ImageAsset의 샷을 연결하세요.", "request_id": request_id, "revision": self._remote_revision}
+                    self._publish_all(live=True, persist=False)
+                    return
                 owner = self._hmb_finish_remote_owners.get(request_id)
                 if owner is not None and owner != self._hmb_finish_active_key:
                     # A retained v1 input replay belongs to its first target.
@@ -2111,6 +2140,10 @@ class HMBFinishLookLibrary(DataNode):
 
     def process(self) -> None:
         if self._node_deleted:
+            return None
+        shot = self._widget_state["shot"]
+        if not self._hmb_finish_has_managed_shot(shot["channel_uuid"], shot["shot_uuid"]):
+            self._publish_all(live=False, persist=False)
             return None
         remote_value = _raw_parameter(self, REMOTE_INPUT_PARAMETER_NAME)
         if remote_value:

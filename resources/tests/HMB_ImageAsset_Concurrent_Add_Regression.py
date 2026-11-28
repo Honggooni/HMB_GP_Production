@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from io import BytesIO
 import json
 import multiprocessing
@@ -15,6 +15,7 @@ import sys
 from tempfile import mkdtemp, TemporaryDirectory
 import time
 import traceback
+from unittest.mock import patch
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -25,6 +26,10 @@ def png(index):
     data = BytesIO()
     Image.new("RGB", (4, 4), (12 + index, 53, 160)).save(data, "PNG")
     return data.getvalue()
+
+
+def authorized_source_project(catalog):
+    return catalog.parent / "AuthorizedProjects" / "SourceShow" / "Ai_Ct_image"
 
 
 def deselect_connected_import(state, uid):
@@ -76,8 +81,7 @@ def client(number, connection, workstation, burst_start):
             media = {}
             keep_selected = external and number % 2 == 0
             if external:
-                source = workstation / "take.png"
-                source.write_bytes(png(number))
+                source = authorized_source_project(catalog) / str(number) / "take.png"
                 state, media = lib._merge_import_input(state, [str(source)])
                 item = next(row for row in state["assets"] if row["source_kind"] == "user" and row["import_index"])
                 assert state["shot_routing"]["shots"][0]["selected_source_uids"] == [anchor["source_uid"], item["source_uid"]]
@@ -101,8 +105,12 @@ def client(number, connection, workstation, burst_start):
                     raise TimeoutError("Burst barrier was not released")
             elif command != "add":
                 raise RuntimeError("Bad test protocol")
+            source_registry = (patch.object(lib, "_PREVIOUS_PROJECTS_ROOT",
+                                           authorized_source_project(catalog).parents[1].resolve().as_posix())
+                               if external else nullcontext())
             try:
-                result = lib._apply_asset_registration(state, request, media)
+                with source_registry:
+                    result = lib._apply_asset_registration(state, request, media)
             except ValueError as exc:
                 connection.send(("rejected", str(exc)))
             else:
@@ -167,7 +175,19 @@ def run_case(base, processes, pipes, count, *, external=False, duplicate=False, 
     metadata = project / ".json"
     metadata.mkdir()
     (folder / "anchor.png").write_bytes(png(6))
-    if not external:
+    if external:
+        source_project = authorized_source_project(catalog)
+        fixtures = []
+        for index in range(count):
+            relative = f"{index}/take.png"
+            source = source_project / relative
+            source.parent.mkdir(parents=True)
+            source.write_bytes(png(index))
+            fixtures.append({"path": relative, "asset_id": f"Source{index}", "image_name": f"Source {index}"})
+        source_manifest = source_project / ".json" / "hmb_image_assets.json"
+        source_manifest.parent.mkdir()
+        source_manifest.write_text(json.dumps({"assets": fixtures}), encoding="utf-8")
+    else:
         for index in range(1 if duplicate else count):
             (folder / f"c{index}.png").write_bytes(png(index))
     manifest = metadata / "hmb_image_assets.json"

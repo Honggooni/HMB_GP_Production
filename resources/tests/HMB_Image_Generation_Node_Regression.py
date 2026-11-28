@@ -896,23 +896,37 @@ class PersonalImageNodeTests(unittest.TestCase):
         self.authored()
         self.node.set_parameter_value("task", "image-to-image")
         self.references(["https://outside.invalid/private.png"])
-        with mock.patch.object(target.File, "aread_data_uri", mock.AsyncMock(side_effect=OSError("Synthetic missing source"))):
+        with mock.patch.object(target.File, "aread_data_uri", mock.AsyncMock(side_effect=OSError("Synthetic missing source"))) as loader:
             self.run_node()
+        loader.assert_not_awaited()
         self.assertFalse(self.node._execution_succeeded)
         self.assertFalse(self.backend.created)
         self.assertFalse(self.node._busy)
 
-    def test_native_url_and_nested_references_are_read_in_order_without_broker_auth(self):
+    def _registered_image(self, name):
+        import HMBImageAssetLibrary as assets
+
+        share = self.folder / "shared"
+        project = share / "superwings12" / "Ai_Ct_image"
+        project.mkdir(parents=True, exist_ok=True)
+        path = project / name
+        path.write_bytes(PNG)
+        assets._write_asset_manifest_record(project, {"path": name, "asset_id": name, "image_name": name})
+        return path, mock.patch.object(assets, "_PREVIOUS_PROJECTS_ROOT", share.as_posix())
+
+    def test_native_nested_registered_references_are_read_in_order(self):
         import base64
         self.authored()
         self.node.set_parameter_value("task", "text-to-image")  # Hidden legacy value is not authoritative.
         uri = "data:image/png;base64," + base64.b64encode(PNG).decode()
-        self.references([[ImageUrlArtifact(value="https://source.invalid/one.png"), [uri]]])
+        first, shared = self._registered_image("one.png")
+        second, _ = self._registered_image("two.png")
+        self.references([[ImageUrlArtifact(value=str(first)), [str(second)]]])
         reader = mock.AsyncMock(return_value=uri)
-        with mock.patch.object(target.File, "aread_data_uri", reader):
+        with shared, mock.patch.object(target.File, "aread_data_uri", reader):
             self.run_node()
         self.assert_success()
-        reader.assert_awaited_once_with(fallback_mime="image/png")
+        reader.assert_not_awaited()
         payload = self.backend.created[0].payload()
         self.assertEqual(payload["task"], "image-to-image")
         self.assertEqual(payload["reference_images"], [uri, uri])
@@ -1025,11 +1039,11 @@ class PersonalImageNodeTests(unittest.TestCase):
 
     def test_image_edit_submits_original_reference_bytes(self):
         self.authored()
-        reference = self.folder / "source.png"
-        reference.write_bytes(PNG)
+        reference, shared = self._registered_image("source.png")
         self.node.set_parameter_value("task", "image-to-image")
         self.references([ImageUrlArtifact(value=str(reference))])
-        self.run_node()
+        with shared:
+            self.run_node()
         self.assert_success()
         references = self.backend.created[0].payload()["reference_images"]
         import base64

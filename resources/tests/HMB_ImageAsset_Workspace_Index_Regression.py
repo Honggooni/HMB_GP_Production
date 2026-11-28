@@ -110,6 +110,105 @@ class WorkspaceIndex(unittest.TestCase):
         new_file.write_text(json.dumps(bad), encoding="utf-8")
         self.assertIsNone(image._read_local_catalog_snapshot(self.project, self.state))
 
+    def test_only_server_registered_images_can_leave_the_workstation(self):
+        source = self.project / "item.png"
+        private = self.catalog.parent / "item.png"
+        private.write_bytes(b"same name outside the project")
+        from HMBSeedanceGeneration import HMBSeedanceGeneration
+
+        node = HMBSeedanceGeneration.__new__(HMBSeedanceGeneration)
+        with patch.object(image, "_PREVIOUS_PROJECTS_ROOT", self.catalog.as_posix()):
+            with self.assertRaisesRegex(ValueError, "소스 누락"):
+                image.require_registered_shared_image(source)
+            image._write_asset_manifest_record(self.project, {
+                "path": "item.png", "asset_id": "Item", "image_name": "Item",
+                "image_main_type": "Character", "image_sub_type": "Full Appearance",
+            })
+            self.assertEqual(image.require_registered_shared_image(source), source.resolve())
+            validated = node._registered_image_inputs({"reference_images": [str(source)]})
+            self.assertEqual(validated["reference_images"], [str(source.resolve())])
+            for candidate in (private, "data:image/png;base64,AA==", "https://example.invalid/item.png"):
+                with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, "소스 누락"):
+                    node._registered_image_inputs({"first_frame": str(candidate), "reference_images": []})
+
+    def _teammate_saved_shot(self):
+        manifest = self.project / ".json" / image.MANIFEST_NAMES[0]
+        manifest.parent.mkdir(exist_ok=True)
+        payload = {
+            "schema": image.ASSET_MANIFEST_SCHEMA,
+            "version": image.ASSET_MANIFEST_VERSION,
+            "project_cache_uid": self.state["project_cache_uid"],
+            "assets": [],
+        }
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        catalog = {"catalog_root": str(self.catalog), "projects": self.state["projects"]}
+        project = catalog["projects"][0]
+        cold = image._read_selected_image_catalog(catalog, project, image._default_state())
+        self.assertFalse(cold["assets"][0]["registered"])
+        image._write_catalog_index(cold)
+
+        # Another workstation introduces a new file and registers both that file
+        # and one already known to this reader as unregistered.
+        relative_paths = ("new.png", "item.png", "history.png")
+        for relative in relative_paths:
+            (self.project / relative).write_bytes(b"catalog fixture file")
+            name = Path(relative).stem
+            payload["assets"].append({"path": relative, "asset_id": name, "image_name": name})
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        saved = image._merge_scan_with_state(image._scan_project_assets(self.project), self.state)
+        indexed = {row["relative_path"]: row for row in saved["assets"]}
+        selected = [indexed[relative] for relative in relative_paths[:2]]
+        for rank, row in enumerate(selected, 1):
+            row.update(selected=True, selection_order=rank)
+            self.assertTrue(row["registered"])
+        history = {"uid": indexed["history.png"]["source_uid"], "label": "Previously removed",
+                   "path": indexed["history.png"]["path"]}
+        shot = saved["shot_routing"]["shots"][0]
+        shot.update(selected_source_uids=[row["source_uid"] for row in selected],
+                    image_link_notices=[history])
+        self.assertEqual(cold["project_cache_uid"], saved["project_cache_uid"])
+        return catalog, project, image._normalize_state(saved)
+
+    def test_teammate_reopen_rechecks_stale_catalog_before_retiring_links(self):
+        catalog, project, saved = self._teammate_saved_shot()
+        original = deepcopy(saved["shot_routing"]["shots"][0])
+        reopened = image._read_selected_image_catalog(catalog, project, saved, reuse_saved=True)
+        self.assertEqual(reopened["shot_routing"]["shots"][0], original)
+        selected = {row["source_uid"]: row for row in reopened["assets"] if row["selected"]}
+        self.assertEqual(set(selected), set(original["selected_source_uids"]))
+        self.assertEqual([selected[uid]["relative_path"] for uid in original["selected_source_uids"]],
+                         ["new.png", "item.png"])
+        self.assertTrue(all(row["registered"] for row in selected.values()))
+
+    def test_teammate_share_failure_does_not_retire_saved_links(self):
+        catalog, project, saved = self._teammate_saved_shot()
+        original = deepcopy(saved["shot_routing"]["shots"][0])
+        with patch.object(image, "_read_asset_manifest", side_effect=OSError("share unavailable")):
+            try:
+                reopened = image._read_selected_image_catalog(catalog, project, saved, reuse_saved=True)
+            except image._ImageAssetSelectionPreparing:
+                reopened = saved
+        self.assertEqual(reopened["shot_routing"]["shots"][0], original)
+        self.assertEqual(saved["shot_routing"]["shots"][0], original)
+
+    def test_offline_disk_cache_does_not_retire_teammate_links(self):
+        _, _, saved = self._teammate_saved_shot()
+        original = deepcopy(saved["shot_routing"]["shots"][0])
+        with patch.object(image, "_discover_shared_image_projects", side_effect=OSError("share unavailable")):
+            reopened = image._load_project_catalog(self.catalog, saved)
+        self.assertEqual(reopened["shot_routing"]["shots"][0], original)
+
+    def test_authoritative_refresh_keeps_actual_deletion_as_history(self):
+        catalog, project, saved = self._teammate_saved_shot()
+        original = saved["shot_routing"]["shots"][0]
+        removed, remaining = original["selected_source_uids"]
+        (self.project / "new.png").unlink()
+        refreshed = image._read_selected_image_catalog(catalog, project, saved, use_shared_cache=False)
+        shot = refreshed["shot_routing"]["shots"][0]
+        self.assertEqual(shot["selected_source_uids"], [remaining])
+        self.assertEqual(shot["image_link_notices"][:-1], original["image_link_notices"])
+        self.assertEqual(shot["image_link_notices"][-1]["uid"], removed)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

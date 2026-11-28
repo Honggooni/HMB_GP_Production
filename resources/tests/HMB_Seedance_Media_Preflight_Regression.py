@@ -93,7 +93,7 @@ def check_seedance_reference_upload_copy():
 check_seedance_reference_upload_copy()
 
 
-def check_lossless_image_cache_after_overwrite():
+def check_original_image_after_overwrite():
     generator = object.__new__(seedance.HMBSeedanceGeneration)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "same-reference.png"
@@ -104,9 +104,11 @@ def check_lossless_image_cache_after_overwrite():
             if color == "blue":
                 assert info.st_size == old_stat.st_size
                 os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
-            result = generator._prepare_cloud_image(str(path), seedance.SEEDANCE_2_5_MODEL_ID, 1)
-            data, filename = result
-            assert filename == "same-reference.webp"
+            original = path.read_bytes()
+            assert len(original) > 2 * 1024 * 1024
+            with mock.patch.object(Image.Image, "save", side_effect=AssertionError("source PNG re-encoded")):
+                data, mime, filename = generator._read_image_for_cloud_upload(str(path))
+            assert (data, mime, filename) == (original, "image/png", path.name)
             with Image.open(BytesIO(data)) as decoded:
                 assert decoded.size == (1024, 768)
                 assert decoded.getpixel((100, 100)) == ((255, 0, 0) if color == "red" else (0, 0, 255))
@@ -114,12 +116,69 @@ def check_lossless_image_cache_after_overwrite():
                 old_stat, previous = info, data
             else:
                 assert data != previous
-            # Re-reading either unchanged revision must reuse its verified packed bytes.
-            with mock.patch.object(Image.Image, "save", side_effect=AssertionError("unchanged PNG re-encoded")):
-                assert generator._prepare_cloud_image(str(path), seedance.SEEDANCE_2_5_MODEL_ID, 1) == result
 
 
-check_lossless_image_cache_after_overwrite()
+check_original_image_after_overwrite()
+
+
+def check_original_image_cloud_wire():
+    node = object.__new__(seedance.HMBSeedanceGeneration)
+    node.name = "Original Image Cloud Wire Regression"
+    node._temporary_video_uploads = []
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        png, webp = folder / "source.png", folder / "source.webp"
+        with Image.new("RGB", (1024, 768), (24, 105, 188)) as image:
+            image.save(png, compress_level=0)
+            image.save(webp, lossless=True)
+        originals = {png.name: png.read_bytes(), webp.name: webp.read_bytes()}
+        assert len(originals[png.name]) > 2 * 1024 * 1024
+
+        def sign_upload(path):
+            assert path.parent.parent == Path("artifact_url_storage")
+            mime_headers = {"content-TYPE": "application/octet-stream", "X-MS-BLOB-Content-Type": "image/jpeg"}
+            if path.suffix == ".png":
+                return {"method": "PUT", "url": f"https://storage.example/{path.name}?proof=opaque",
+                        "headers": {**mime_headers, "X-MS-Blob-Type": "BlockBlob"}}
+            return {"method": "PUT", "url": f"https://fixture.blob.core.windows.net/{path.name}?proof=opaque",
+                    "headers": mime_headers}
+
+        def sign_download(path):
+            return f"https://storage.example/{path.parent.name}/{path.name}?signed=opaque"
+
+        driver = SimpleNamespace(
+            create_signed_upload_url=mock.Mock(side_effect=sign_upload),
+            create_signed_download_url=mock.Mock(side_effect=sign_download),
+        )
+        params = {
+            "model_id": seedance.SEEDANCE_2_5_MODEL_ID, "_hmb_cloud_reference_proof_v1": True,
+            "first_frame": str(png), "last_frame": str(webp),
+            "reference_images": [str(webp), str(png), str(webp)],
+        }
+        with (
+            mock.patch.object(seedance, "MAX_IMAGE_BYTES", len(originals[png.name]) + 1),
+            mock.patch.object(seedance, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as scratch,
+            mock.patch.object(seedance.httpx, "request") as put,
+        ):
+            ready = node._prepare_video_references_for_run(params, cloud_driver=driver)
+        assert sum(call.kwargs.get("prefix") == "hmb-render-inputs-" for call in scratch.call_args_list) == 1
+        keys = [call.args[0] for call in driver.create_signed_upload_url.call_args_list]
+        assert [key.name for key in keys] == [png.name, webp.name]
+        assert [call.args[0] for call in driver.create_signed_download_url.call_args_list] == keys
+        cases = (("first_frame", "image/png"), ("last_frame", "image/webp"))
+        for (slot, mime), key, call in zip(cases, keys, put.call_args_list, strict=True):
+            source = originals[key.name]
+            assert call.args[0] == "PUT" and call.kwargs["content"] == source
+            headers = {name.lower(): value for name, value in call.kwargs["headers"].items()}
+            assert len(headers) == len(call.kwargs["headers"])
+            assert headers["content-type"] == headers["x-ms-blob-content-type"] == mime
+            assert headers["content-length"] == str(len(source))
+            assert ready[slot] == sign_download(key) + expected_proof(source)
+        assert ready["reference_images"] == [ready["last_frame"], ready["first_frame"], ready["last_frame"]]
+        assert params["reference_images"] == [str(webp), str(png), str(webp)]
+
+
+check_original_image_cloud_wire()
 
 assert callable(
     getattr(seedance.GriptapeCloudStorageDriver, "create_signed_upload_url", None)
@@ -165,7 +224,7 @@ with tempfile.TemporaryDirectory() as temporary:
     image_a = folder / "large-a.png"
     image_b = folder / "large-b.png"
     with image_a.open("wb") as stream:
-        stream.truncate(29 * 1024 * 1024)
+        stream.truncate(seedance.MAX_IMAGE_BYTES - 1)
     with image_b.open("wb") as stream:
         stream.truncate(20 * 1024 * 1024)
     try:
@@ -348,11 +407,11 @@ with tempfile.TemporaryDirectory() as temporary:
         destination.write(image_bytes)
         return b""
     cloud_node._download_external_media = read_remote
-    stream = BytesIO()
-    with wave.open(stream, "wb") as output:
-        output.setparams((1, 2, 8000, 0, "NONE", ""))
-        output.writeframes(bytes(3200))
-    audio = stream.getvalue()
+    audio_stream = BytesIO()
+    with wave.open(audio_stream, "wb") as track:
+        track.setparams((1, 2, 16000, 1600, "NONE", "not compressed"))
+        track.writeframes(bytes(1600 * 2))
+    audio = audio_stream.getvalue()
     audio_uri = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
     cloud_params = {
         "model_id": seedance.SEEDANCE_2_5_MODEL_ID,
@@ -388,12 +447,10 @@ with tempfile.TemporaryDirectory() as temporary:
     assert cloud_driver.uploads[-1]["file_content"] == audio
     assert all("#" not in url for url in urls)
 
-    # Proofs for each slot use the bytes that this driver actually received.
-    # The PNG is converted to a smaller lossless WebP before uploading.
+    # Proofs for each slot use the original image bytes that this driver received.
     proof_driver = LegacyCloudDriver()
-    with (
-        mock.patch.object(seedance, "SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD", 1),
-        mock.patch.object(cloud_node, "_reference_video_upload_path", side_effect=lambda path, model: nullcontext(path)),
+    with mock.patch.object(
+        cloud_node, "_reference_video_upload_path", side_effect=lambda path, model: nullcontext(path),
     ):
         tested = cloud_node._prepare_video_references_for_run(
             dict(cloud_params, _hmb_cloud_reference_proof_v1=True), cloud_driver=proof_driver,
@@ -443,9 +500,7 @@ with tempfile.TemporaryDirectory() as temporary:
         else:
             raise AssertionError("The last missing or empty reference allowed a shortened render request")
     for entry in proof_driver.uploads[:3]:
-        assert entry["path"].suffix == ".webp" and entry["file_content"] != image_bytes
-        with Image.open(BytesIO(entry["file_content"])) as packed, Image.open(image_path) as original:
-            assert packed.format == "WEBP" and packed.tobytes() == original.tobytes()
+        assert entry["path"].suffix == ".png" and entry["file_content"] == image_bytes
 
     signed_bytes_driver = SimpleNamespace(
         create_signed_upload_url=lambda _path: {"method": "PUT", "url": "https://storage.example/upload"},

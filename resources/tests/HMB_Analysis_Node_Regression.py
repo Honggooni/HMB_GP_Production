@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -99,6 +100,7 @@ class AnalysisNodeRegression(unittest.TestCase):
     @staticmethod
     def make_node():
         node = object.__new__(analysis.HMBAnalysisAgent)
+        node.name = f"Fixture Analysis {id(node)}"
         node._lock = threading.RLock()
         node._active = ("", "")
         node._slots = {}
@@ -694,6 +696,45 @@ class AnalysisNodeRegression(unittest.TestCase):
         self.assertEqual(calls, ["before", "after"])
         self.assertIn("new before", self.prompt._hmb_apply_analysis_fields.call_args.args[2]["VIDEO_VFX"])
         self.assertEqual(self.context("agent")["items"][0]["observation"], "new after")
+
+    def test_image_analysis_requires_a_registered_server_original(self):
+        import HMBImageAssetLibrary as image_assets
+
+        shared = self.path.parent / "Projects"
+        project = shared / "Show" / "Ai_Ct_image"
+        manifest = project / ".json" / image_assets.MANIFEST_NAMES[0]
+        manifest.parent.mkdir(parents=True)
+        registered = project / "sample.png"
+        private = self.path.with_suffix(".png")
+        for path in (registered, private):
+            path.write_bytes(b"same bytes on a shared and private path")
+        manifest.write_text(json.dumps({"assets": [{"path": registered.name}]}), encoding="utf-8")
+        rows = {name: {"kind": "image", "source_id": name, "name": path.name, "path": str(path),
+                       "shot_reference": "@image1"}
+                for name, path in (("shared", registered), ("private", private))}
+        self.node._role = "after"
+        scope = {"channel_uuid": "channel", "shot_uuid": "shot-1"}
+        result = {"kind": "image", "model": "gemini-4-argon", "cache_key": "a" * 64,
+                  "source_digest": "b" * 64, "observations": {"composition": [{"observation": "fixture"}]}}
+
+        async def run():
+            runtime = SimpleNamespace(GriptapeNodes=SimpleNamespace(
+                EventManager=lambda: SimpleNamespace(event_loop=asyncio.get_running_loop())))
+            with (mock.patch.dict(sys.modules, {"griptape_nodes.retained_mode.griptape_nodes": runtime}),
+                  mock.patch.object(image_assets, "_PREVIOUS_PROJECTS_ROOT", str(shared)),
+                  mock.patch.object(self.prompt, "_hmb_analysis_sources_for", return_value=list(rows.values())),
+                  mock.patch.object(self.prompt, "_hmb_analysis_reference_for", side_effect=lambda source_id, **_: rows.get(source_id)),
+                  mock.patch("_hmb_reference_analysis.analyze_reference", return_value=result) as analyzer):
+                self.assertTrue(self.node._hmb_pick_prompt_reference(self.prompt, **scope, kind="image", source_id="shared"))
+                self.command("analyze", model="gemini-4-argon", confirmed_paid=True, reanalyze=True)
+                self.assertEqual(await asyncio.wrap_future(self.node._job_completion), "")
+                self.assertEqual(Path(analyzer.call_args.kwargs["source"]), registered.resolve())
+                self.assertTrue(self.node._hmb_pick_prompt_reference(self.prompt, **scope, kind="image", source_id="private"))
+                self.command("analyze", model="gemini-4-argon", confirmed_paid=True, reanalyze=True)
+                self.assertIn("소스 누락", await asyncio.wrap_future(self.node._job_completion))
+                self.assertEqual(self.node._error, "ANALYSIS_SOURCE_MISSING")
+                self.assertEqual(analyzer.call_count, 1)
+        asyncio.run(run())
 
     def test_rapid_same_size_same_timestamp_replacements_and_unversioned_file(self):
         import _hmb_analysis_delivery as delivery

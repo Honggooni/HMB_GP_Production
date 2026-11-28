@@ -1,6 +1,6 @@
 # HMB GP Production
 
-Team **v0.9.79**는 Griptape Desktop **0.31.0**용 HMB 노드 라이브러리입니다.
+Team **v0.9.81**는 Griptape Desktop **0.31.0**용 HMB 노드 라이브러리입니다.
 
 ## 샷 실행과 재시도
 

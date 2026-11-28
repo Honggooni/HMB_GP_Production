@@ -246,6 +246,34 @@ class DraftFinalAuthoringTests(unittest.TestCase):
         preview['prompt'] = 'edited without another Agent run'
         self.assertNotEqual(node._render_authoring_digest(), digest)
 
+    def test_saved_draft_alone_republishes_run_on_parameter_edits(self):
+        node = self.make_node()
+        digest = node._render_authoring_digest()
+        node._store_draft_source(fixture.completed_source(node, render_input_sha256=digest))
+        self.assertFalse(node.get_parameter_value(t.COMPLETED_RENDER_INPUTS_PARAMETER))
+        header = t.SEEDANCE_SHOT_WIDGET_PARAMETER
+        node._sync_seedance_shot_widget(emit_change=True)
+        initial = node.get_parameter_value(header)['draft']
+        self.assertTrue(initial['run_locked'])
+        self.assertTrue(initial['final_available'])
+
+        for name, changed in (('duration', 6), ('ratio', '9:16'), ('prompt', 'New same-Shot Agent final')):
+            with self.subTest(parameter=name):
+                previous = node.get_parameter_value(name)
+                parameter = SimpleNamespace(name=name)
+                node.set_parameter_value(name, changed)
+                node.after_value_set(parameter, changed)
+                state = node.get_parameter_value(header)['draft']
+                self.assertFalse(state['run_locked'])
+                self.assertFalse(state['final_visible'])
+                node.set_parameter_value(name, previous)
+                node.after_value_set(parameter, previous)
+                restored = node.get_parameter_value(header)['draft']
+                self.assertTrue(restored['run_locked'])
+                self.assertTrue(restored['final_available'])
+                self.assertEqual(restored['job_id'], JOB)
+        self.assertEqual(node.bridge.posts, [])
+
     def test_compact_image_port_uses_only_selected_shot_published_media(self):
         from HMBImageAssetLibrary import HMBImageAssetLibrary
 

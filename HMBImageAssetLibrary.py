@@ -39,7 +39,7 @@ if str(_THIS_DIR) not in sys.path:
 
 from _hmb_deletion_guard import hmb_binding_mutation
 from _hmb_image_asset_sites import (
-    run_site_folder_command, get_site_settings, save_site_settings,
+    _mapped_path, run_site_folder_command, get_site_settings, save_site_settings,
     site_profiles, verify_folder_identity, image_execution_workspace,
 )
 from _hmb_node_controls import add_project_folder_parameter, add_site_folder_parameter
@@ -196,23 +196,42 @@ _PREVIOUS_PROJECTS_ROOT = "//192.168.200.19/v/projects"
 _RETIRED_PROJECTS_ROOT = "//fin-rcomp1/Composite_Team/projects_AI"
 
 
+def _production_projects_address() -> str:
+    if os.name != "nt" or PRODUCTION_PROJECTS_ROOT != "P:/projects":
+        return PRODUCTION_PROJECTS_ROOT
+    import ctypes
+
+    remote = ctypes.create_unicode_buffer(1024)
+    size = ctypes.c_ulong(len(remote))
+    if ctypes.windll.mpr.WNetGetConnectionW("P:", remote, ctypes.byref(size)) == 0:
+        mapped = remote.value.replace("\\", "/").rstrip("/").casefold()
+        if f"{mapped}/projects" == _PREVIOUS_PROJECTS_ROOT.casefold():
+            return PRODUCTION_PROJECTS_ROOT
+    return _PREVIOUS_PROJECTS_ROOT
+
+
+_PRODUCTION_PROJECTS_ADDRESS = _production_projects_address()
+
+
 def _relocate_image_project_path(value: Any) -> str:
     """Replace retired saved addresses in memory; never read the old storage."""
     text = str(value or "").strip()
     path = text.replace("\\", "/")
+    destination = (_PRODUCTION_PROJECTS_ADDRESS if PRODUCTION_PROJECTS_ROOT == "P:/projects"
+                   else PRODUCTION_PROJECTS_ROOT)
     prefix = _RETIRED_PROJECTS_ROOT
     if path.casefold() == prefix.casefold() or path.casefold().startswith(prefix.casefold() + "/"):
         parts = path[len(prefix):].strip("/").split("/")
         if not parts[0]:
-            return PRODUCTION_PROJECTS_ROOT
+            return destination
         if any(part in (".", "..") for part in parts):
             return text
-        return "/".join((PRODUCTION_PROJECTS_ROOT, parts[0], "Ai_Ct_image", *parts[1:]))
+        return "/".join((destination, parts[0], "Ai_Ct_image", *parts[1:]))
     if "://" in path or any(part in (".", "..") for part in path.split("/")):
         return text
     for alias in (_PREVIOUS_PROJECTS_ROOT, PRODUCTION_PROJECTS_ROOT):
         if path.casefold() == alias.casefold() or path.casefold().startswith(alias.casefold() + "/"):
-            path = PRODUCTION_PROJECTS_ROOT + path[len(alias):]
+            path = destination + path[len(alias):]
             break
     else:
         return text
@@ -3823,6 +3842,77 @@ def _read_selection_registrations(root, selected):
     return records
 
 
+def _shared_registration_contains(root: Path, relative: Path) -> bool:
+    address = relative.as_posix()
+    return (not _is_user_import_relative_path(address)
+            and address.casefold() in _read_asset_manifest(root))
+
+
+def _is_shared_unc_path(path: Path) -> bool:
+    if not path.drive.startswith("\\\\"):
+        return False
+    server = path.drive[2:].partition("\\")[0].casefold().rstrip(".")
+    station = os.environ.get("COMPUTERNAME", "").casefold()
+    return server.split(".", 1)[0] not in {"", "?", "localhost", "localhost6", "127", "--1", station}
+
+
+def _registered_linked_shared_image(path: Path, resolved: Path, shared: Path) -> bool:
+    if not _is_shared_unc_path(resolved):
+        return False
+    projects = _discover_shared_image_projects(shared)["projects"]
+    profiles = site_profiles(projects, "image")
+    for project in projects:
+        profile = profiles.get(project.get("project_uid") or project.get("project_id"))
+        if not profile:
+            continue
+        for link in profile["links"]:
+            configured = Path(link["root"])
+            # Ignore links on other servers without probing their directories.
+            if not (resolved.is_relative_to(_mapped_path(configured)) or path.is_relative_to(configured)):
+                continue
+            try:
+                headquarters = Path(project["path"])
+                root = _site_root(headquarters, get_site_settings(headquarters, fresh=True), link["id"])
+                if not _is_shared_unc_path(root):
+                    continue
+                if _shared_registration_contains(root, resolved.relative_to(root)):
+                    return True
+            except (OSError, ValueError):
+                continue
+    return False
+
+
+def require_registered_shared_image(value: Any) -> Path:
+    """Resolve an image from the production registry before any transfer."""
+    message = "소스 누락: 서버 프로젝트에 등록된 원본 이미지를 선택하세요."
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ValueError(message)
+    if re.match(r"^(?:data:|[A-Za-z][A-Za-z0-9+.-]*://)", str(value).strip(), re.IGNORECASE):
+        raise ValueError(message)
+    try:
+        from griptape_nodes.files.file import File
+
+        path = Path(value)
+        if not path.is_absolute():
+            path = Path(File(str(value)).resolve())
+        if not path.is_absolute() or path.suffix.casefold() not in IMAGE_EXTENSIONS:
+            raise ValueError(message)
+        shared = Path(_PREVIOUS_PROJECTS_ROOT)
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file() or _is_reparse_point(path):
+            raise ValueError(message)
+        if resolved.is_relative_to(shared):
+            relative = resolved.relative_to(shared)
+            if (len(relative.parts) >= 3 and relative.parts[1].casefold() == "ai_ct_image"
+                    and _shared_registration_contains(shared.joinpath(*relative.parts[:2]), Path(*relative.parts[2:]))):
+                return resolved
+        if _registered_linked_shared_image(path, resolved, shared):
+            return resolved
+        raise ValueError(message)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(message) from exc
+
+
 def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catalog=False):
     # Only rows obtained from a verified project read or a successful local Add
     # can authorize a handover. Workflow/preview metadata is never authority.
@@ -3832,6 +3922,8 @@ def _manifest_for_selection(root, selected, *, catalog_root=None, wait_for_catal
         pinned = _CATALOG_READS.get(key)
         session_started = roster_key in _CATALOG_SESSION_LOCKS
         roster = _CATALOG_READS.get(roster_key)
+    if wait_for_catalog and (pinned is not None or not session_started):
+        return _read_selection_registrations(root, selected)
     if pinned is not None and pinned.exception() is None:
         facts = pinned.result()
     elif session_started or pinned is not None:
@@ -5354,10 +5446,7 @@ def _restore_site_selection(state, previous, same_project):
         del memory[uid]
 
 
-def _merge_scan_with_state(
-    scan: Dict[str, Any],
-    previous_state: Dict[str, Any],
-) -> Dict[str, Any]:
+def _same_image_catalog(scan: Dict[str, Any], previous_state: Dict[str, Any]) -> bool:
     scan_cache_uid = _clean(scan.get("project_cache_uid"))
     previous_cache_uid = _clean(previous_state.get("project_cache_uid"))
     same_project = bool(
@@ -5375,6 +5464,22 @@ def _merge_scan_with_state(
             .replace("\\", "/")
             .casefold()
         )
+    return same_project
+
+
+def _catalog_conflicts_with_saved_selection(scan: Dict[str, Any], state: Dict[str, Any]) -> bool:
+    if not _same_image_catalog(scan, state):
+        return False
+    registered = {row["source_uid"] for row in scan["assets"] if row.get("registered")}
+    return any(row.get("selected") and row.get("registered") and row.get("source_kind") == "project"
+               and row["source_uid"] not in registered for row in state["assets"])
+
+
+def _merge_scan_with_state(
+    scan: Dict[str, Any],
+    previous_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    same_project = _same_image_catalog(scan, previous_state)
     previous_assets = {
         _clean(asset.get("asset_library_id")): asset
         for asset in previous_state.get("assets", [])
@@ -6045,7 +6150,7 @@ def _scan_linked_sites(project: Path, settings: dict, prior: dict, *, pinned=Non
 
 def _read_verified_image_catalog(
     catalog: Dict[str, Any], selected: Dict[str, Any], state: Dict[str, Any], *,
-    use_shared_cache: bool = True, reuse_saved: bool = False,
+    use_shared_cache: bool = True, reuse_saved: bool = False, recheck: bool = False,
 ) -> Dict[str, Any]:
     """Share filesystem facts across warmup, new nodes and workflow restores."""
     project = Path(selected["path"])
@@ -6056,7 +6161,7 @@ def _read_verified_image_catalog(
         facts = None
         settings = get_site_settings(project)
         pinned = None
-        if use_shared_cache:
+        if use_shared_cache and not recheck:
             prefix = _session_catalog_key("projects", project)[1]
             with _SHARED_CATALOG_CACHE_LOCK:
                 pinned = next((value.result() for key, value in reversed(_CATALOG_READS.items())
@@ -6073,7 +6178,7 @@ def _read_verified_image_catalog(
             facts = _rebind_shared_catalog_snapshot(
                 _shared_catalog_snapshot(state), selected, catalog, refresh_manifest=True
             )
-        if facts is None and use_shared_cache:
+        if facts is None and use_shared_cache and not recheck:
             facts = _read_catalog_index(project, neutral)
         if facts is None:
             facts = _scan_project_assets(project, previous_scan=state, verify_all_files=not use_shared_cache)
@@ -6086,7 +6191,22 @@ def _read_verified_image_catalog(
 
     if not use_shared_cache:
         get_site_settings(project, fresh=True)
-    return _catalog_read_once(_session_catalog_key("catalog", project), read, refresh=not use_shared_cache)
+    return _catalog_read_once(_session_catalog_key("catalog", project), read, refresh=recheck or not use_shared_cache)
+
+
+def _saved_catalog_requires_shared_recheck(facts, state, project, had_snapshot):
+    if _catalog_conflicts_with_saved_selection(facts, state):
+        return True
+    if not had_snapshot or not _same_image_catalog(facts, state):
+        return False
+    selected = [row for row in state["assets"] if row.get("selected") and row.get("registered")
+                and row.get("source_kind") == "project"]
+    if not selected:
+        return False
+    registrations = _read_selection_registrations(project, selected)
+    current = {row["source_uid"]: row for row in facts["assets"]}
+    return any(not _verified_project_relative_path(current[row["source_uid"]], facts, registrations)
+               for row in selected)
 
 
 def _read_selected_image_catalog(
@@ -6108,7 +6228,21 @@ def _read_selected_image_catalog(
         if offline is None:
             raise
         facts = offline
-    same_revision = use_shared_cache and (had_snapshot or (
+    rechecked = False
+    try:
+        # Compare exact selected sources against the shared registry. A catalogue
+        # cached before another workstation's edits cannot retire a saved link.
+        check_shared = (use_shared_cache and reuse_saved
+                        and _saved_catalog_requires_shared_recheck(facts, state, project, had_snapshot))
+        if check_shared:
+            facts = _read_verified_image_catalog(catalog, selected, state, reuse_saved=True, recheck=True)
+    except (OSError, ValueError) as exc:
+        raise _ImageAssetSelectionPreparing("공유 프로젝트의 이미지 등록을 확인하는 중입니다.") from exc
+    if check_shared:
+        if facts.get("warnings") and _catalog_conflicts_with_saved_selection(facts, state):
+            raise _ImageAssetSelectionPreparing("공유 프로젝트의 이미지 등록을 확인하는 중입니다.")
+        rechecked = True
+    same_revision = use_shared_cache and ((had_snapshot and not rechecked) or (
         state.get("manifest_signature") == facts["manifest_signature"]
         and state.get("folder_signature") == facts["folder_signature"]))
     merged = _merge_scan_with_state(facts, state)
@@ -6375,6 +6509,8 @@ def _read_local_catalog_snapshot(project_root: Any, previous_state: Dict[str, An
             if origin and origin.casefold() != virtual_path.casefold():
                 return None
             asset.pop("registration_relative_path", None)
+        if _catalog_conflicts_with_saved_selection(raw, previous_state):
+            return {**previous_state, "warnings": ["공유 프로젝트의 이미지 등록을 확인하는 중입니다."]}
         merged = _merge_scan_with_state(raw, previous_state)
         merged["scan_revision"] = _non_negative_int(previous_state.get("scan_revision"))
         return merged
@@ -6935,7 +7071,7 @@ def _copy_import_to_project(
 def _register_external_file(asset, media, root, folder, project_id, record):
     root = _resolve_image_path(root, strict=True)
     parent = _registration_folder_path(root, folder)
-    source = _local_import_source(asset, media)
+    source = require_registered_shared_image(_local_import_source(asset, media))
     filename = Path(_safe_import_filename(asset, media, source))
     numbered_name = re.compile(re.escape(filename.stem) + r"_[1-9][0-9]*" + re.escape(filename.suffix), re.I)
     # Choose or create the file and claim its registration in one shared
@@ -8575,6 +8711,9 @@ _PROJECT_RESOLUTION_KEY_FIELDS = (
     "path",
     "relative_path",
     "extension",
+    "width",
+    "height",
+    "media_signature",
     "image_main_type",
     "image_sub_type",
     "source_type",
@@ -8813,6 +8952,15 @@ def _resolve_selected_assets(
                         except _ImageAssetSelectionPreparing:
                             file_pending = True
                 if relative_path:
+                    catalog_asset = manifest_records.get(relative_path.casefold(), {})
+                    if (catalog_asset.get("asset_library_id") == asset.get("asset_library_id")
+                            and catalog_asset.get("asset_project_uid") == asset.get("asset_project_uid")):
+                        # Pinned catalog rows provide verified media facts; a
+                        # raw registration JSON has neither catalog identity.
+                        facts = {key: catalog_asset[key] for key in
+                                 ("width", "height", "media_signature") if catalog_asset.get(key)}
+                        if any(verified_asset.get(key) != value for key, value in facts.items()):
+                            verified_asset = {**verified_asset, **facts}
                     media_value = _resolved_media_value(verified_asset.get("path"))
                 else:
                     reason = "project_catalog_preparing" if manifest_pending or file_pending else "project_asset_verification_failed"
@@ -9155,6 +9303,10 @@ def _shot_asset_metadata(
     }
     if asset.get("media_signature"):
         metadata["media_signature"] = _clean(asset["media_signature"])
+    if verified:
+        # This address stays in the internal Shot envelope. The actual local
+        # file reference is paired separately in media_by_source_uid.
+        metadata["relative_path"] = relative_path
     return metadata
 
 
@@ -11064,7 +11216,7 @@ class HMBImageAssetLibrary(DataNode):
             return None
         order = tuple(row.get("selected_source_uids", ()))
         selected = {a.get("source_uid"): a for a in state.get("assets", ()) if a.get("selected")}
-        fields = _PROJECT_RESOLUTION_KEY_FIELDS + ("media_signature",)
+        fields = _PROJECT_RESOLUTION_KEY_FIELDS
         hierarchy = state.get("shot_hierarchy") or {}
         members = hierarchy.get("members") or ()
         member = next((item for item in members if item["gp_shot_uuid"] == shot), None)

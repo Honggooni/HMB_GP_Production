@@ -30,6 +30,7 @@ MAX_INPUT_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_ENCODED_BYTES = 3 * 1024 * 1024
 PREPARATION_SECONDS = 12.0
 PER_DECODE_SECONDS = 2.0
+_REFERENCE_PIXELS_LABEL = "HMB REFERENCE PIXELS (SOURCE DATA): "
 _CACHE_BYTES_LIMIT = 24 * 1024 * 1024
 _CACHE: OrderedDict[tuple, tuple[bytes, int, int, float | None]] = OrderedDict()
 _PROBE_CACHE: OrderedDict[tuple, dict] = OrderedDict()
@@ -242,11 +243,20 @@ def merge_analysis_originals(snapshot: dict, originals: list[dict]) -> dict:
     return result
 
 
-def _source(value: Any, kind: str, *, allow_verified_network: bool = False) -> tuple[Path | bytes, tuple]:
+def _source(value: Any, kind: str, *, allow_verified_network: bool = False,
+            require_shared_image: bool = False) -> tuple[Path | bytes, tuple]:
     """Resolve a selected local/project reference without fetching remote URLs."""
     text = str(value or "").strip()
     if not text or len(text) > MAX_INPUT_IMAGE_BYTES * 2:
         raise ValueError("unavailable")
+    if kind == "image" and require_shared_image:
+        from HMBImageAssetLibrary import require_registered_shared_image
+
+        try:
+            text = str(require_registered_shared_image(text))
+        except ValueError as exc:
+            raise ValueError("source_missing") from exc
+        allow_verified_network = True
     if kind == "image" and text.startswith("data:image/"):
         header, payload = text.split(",", 1)
         if not header.endswith(";base64"):
@@ -429,6 +439,45 @@ def _observation_row(record: dict, kind: str) -> dict:
             "video_uid": _audit_id(identity.get("video_uid") or metadata.get("video_uid")),
             "source_uid": _audit_id(identity.get("source_uid") or metadata.get("source_uid")),
             "bundle_run_id": _bundle(record)}
+
+def native_has_registered_images(prompt: Any, tokens: list[str], coverage: list[dict]) -> bool:
+    """Confirm the ordered image blocks being passed to the native adapter."""
+    if not tokens:
+        return True
+    try:
+        from griptape.artifacts import ImageArtifact, ListArtifact, TextArtifact
+
+        legacy = isinstance(prompt, ListArtifact)
+        if not legacy:
+            from pydantic_ai.messages import BinaryContent
+        blocks = prompt.value if legacy else prompt
+        if not isinstance(blocks, list):
+            return False
+        required = set(tokens)
+        expected = [row for row in coverage if row["kind"] == "image" and row["media_token"] in required]
+        if [row["media_token"] for row in expected] != tokens:
+            return False
+        attached = []
+        for label, image in zip(blocks, blocks[1:]):
+            text = label.value if isinstance(label, TextArtifact) else label
+            if not isinstance(text, str) or not text.startswith(_REFERENCE_PIXELS_LABEL):
+                continue
+            metadata = json.loads(text[len(_REFERENCE_PIXELS_LABEL):])
+            token = metadata.get("token")
+            if metadata.get("kind") != "image" or token not in required:
+                continue
+            if legacy and isinstance(image, ImageArtifact) and image.format == "png":
+                blob = image.to_bytes()
+            elif not legacy and isinstance(image, BinaryContent) and image.media_type == "image/png":
+                blob = image.data
+            else:
+                return False
+            if not blob.startswith(b"\x89PNG\r\n\x1a\n"):
+                return False
+            attached.append((token, hashlib.sha256(blob).hexdigest()))
+        return attached == [(row["media_token"], row["image_payload_sha256"]) for row in expected]
+    except (AttributeError, ImportError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _role(record: dict, kind: str) -> str:
@@ -652,6 +701,7 @@ def _audio_clip(record: dict, ffmpeg: Path | None, deadline: float) -> bytes:
 
 def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                    registered_project_images: dict[str, str] | None = None,
+                   require_shared_images: bool = False,
                    is_live: Callable[[], bool] = lambda: True,
                    report_sink: Callable[[dict], None] | None = None) -> Any:
     """Return a native ListArtifact, or the original text after optional failure.
@@ -694,6 +744,10 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         # Only a live, frozen Prompt Shot supplies this permission, separately
         # from the serialized media rows used by web replay and unbound nodes.
         project_images = registered_project_images or {}
+        def is_registered_image(record: dict) -> bool:
+            source = record.get("source")
+            return bool(source) and project_images.get(_token(record)) == source
+
         if project_images and len(images) > image_limit:
             image_limit = min(MAX_PROJECT_IMAGE_ATTACHMENTS, len(images))
             # Keep the original/control paired samples in larger image selections.
@@ -741,7 +795,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
             if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
                 return "deadline" if time.monotonic() >= deadline else "decode_timeout"
             return str(exc) if isinstance(exc, ValueError) and str(exc) in {
-                "nonlocal", "unavailable", "input_limit", "decoder_unavailable", "dimensions"} else "decode_unavailable"
+                "nonlocal", "unavailable", "source_missing", "input_limit", "decoder_unavailable", "dimensions"} else "decode_unavailable"
 
         def append(record: dict, kind: str, sample: dict | None, group_id: str = "",
                    normalized_target: float | None = None) -> bool:
@@ -754,9 +808,12 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                 return False
             try:
                 value = record.get("source")
-                registered_image = kind == "image" and bool(value) and project_images.get(_token(record)) == value
-                source, identity = _source(value, kind, allow_verified_network=(
-                    registered_image or record.get("_hmb_verified_analysis_original") is True))
+                registered_image = kind == "image" and is_registered_image(record)
+                source, identity = _source(
+                    value, kind, allow_verified_network=(
+                        registered_image or record.get("_hmb_verified_analysis_original") is True),
+                    require_shared_image=require_shared_images,
+                )
                 seek = sample["seek"] if sample else None
                 with _CACHE_LOCK:
                     hit = (*identity, seek, MAX_EDGE) in _CACHE
@@ -802,7 +859,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                     label["alignment_retry"] = retried
                     if group_id:
                         label["sample_group_id"] = group_id
-                label_text = ("HMB REFERENCE PIXELS (SOURCE DATA): " +
+                label_text = (_REFERENCE_PIXELS_LABEL +
                     json.dumps(label, ensure_ascii=False, separators=(",", ":")))
                 if native_user_content:
                     attachments.extend([label_text, BinaryContent(data=blob, media_type="image/png")])
@@ -814,6 +871,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
                     "pts_status", "sample_reason", "requested_source_frame", "normalized_pts_seconds",
                     "decode_seek_seconds", "alignment_retry", "sample_group_id") if key in label})
                 observed["status"] = "pixels_attached"
+                if registered_image:
+                    observed["image_payload_sha256"] = hashlib.sha256(blob).hexdigest()
                 report["coverage"].append(observed)
                 count += 1
                 image_count += int(kind == "image")
@@ -827,7 +886,8 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         # repeats. Character sheets cannot consume the Original/Mask/Depth slots.
         all_project_images_fit = bool(project_images) and len(images) <= image_limit
         if not all_project_images_fit:
-            images.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
+            images.sort(key=lambda v: (0, 0, 0) if is_registered_image(v) else (
+                                       1, 0 if v.get("_hmb_verified_analysis_original") is True else 1,
                                        0 if _role(v, "image") == "character" else 1))
         priorities = {"original": 0, "mask": 1, "depth": 2, "motion_guide": 3, "video": 4}
         videos.sort(key=lambda v: (0 if v.get("_hmb_verified_analysis_original") is True else 1,
@@ -938,7 +998,7 @@ def augment_prompt(prompt: str, snapshot: dict, agent: Any, *,
         seen_image_roles = set()
         for record in images:
             role = _role(record, "image")
-            if all_project_images_fit or role not in seen_image_roles:
+            if all_project_images_fit or is_registered_image(record) or role not in seen_image_roles:
                 if append(record, "image", None):
                     seen_image_roles.add(role)
         seen_video_roles = set()

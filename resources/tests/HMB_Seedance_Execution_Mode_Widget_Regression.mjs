@@ -98,16 +98,23 @@ try {
       const style = getComputedStyle(button);
       return [style.opacity, style.cursor, style.pointerEvents, button.inert];
     };
-    fixture.update({ ...value, draft: { ...value.draft, run_locked: true } });
+    fixture.update({ ...value, draft: { ...value.draft, run_locked: true, final_available: false,
+      source_completed: true, final_state: "unknown" } });
     const locked = appearance(run), other = appearance(neighbor);
-    fixture.update(value);
+    const retryVisible = () => !fixture.header.querySelector("[data-hmb-seedance-retry-final]").hidden;
+    const hadDraftRetry = retryVisible();
+    fixture.update({ ...value, draft: { ...value.draft, run_locked: false, final_available: false,
+      job_id: "", source_completed: false, final_state: "unavailable", final_visible: false } });
     const restored = appearance(run);
+    const oldDraftRetryHidden = !retryVisible();
     fixture.cleanup();
-    return { locked, other, restored };
+    return { locked, other, restored, hadDraftRetry, oldDraftRetryHidden };
   });
   assert.deepEqual(runStyles.locked, ["0.45", "default", "none", true]);
   assert.deepEqual(runStyles.other, ["0.9", "pointer", "auto", false]);
   assert.deepEqual(runStyles.restored, runStyles.other);
+  assert.equal(runStyles.hadDraftRetry, true);
+  assert.equal(runStyles.oldDraftRetryHidden, true);
   report.cases.push("completed_render_styles_only_the_native_Run_button_until_inputs_change");
 
   // Missing catalog is a waiting Shot, never independent Only. Old hosts keep

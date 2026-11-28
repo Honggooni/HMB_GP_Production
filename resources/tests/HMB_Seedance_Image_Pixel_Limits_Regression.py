@@ -94,14 +94,14 @@ class SeedanceImagePixelLimitsRegression(unittest.TestCase):
             _inspect_image(data,media_name="test.png",reference_ordinal=1,max_pixels=220,max_bytes=MAX_IMAGE_BYTES)
         self.assertEqual(caught.exception.code,"SEEDANCE_IMAGE_PIXEL_LIMIT")
 
-    def test_byte_limit_remains_strictly_below_30_mib(self):
+    def test_byte_limit_matches_broker_decimal_cap(self):
         data=image_bytes("PNG")
         self.assertEqual(_inspect_image(data,media_name="",reference_ordinal=1,max_pixels=MAX_IMAGE_PIXELS,max_bytes=len(data)+1)["bytes"],len(data))
         for maximum in (len(data),len(data)-1):
             with self.subTest(maximum=maximum), self.assertRaises(SeedanceImageLimitError) as caught:
                 _inspect_image(data,media_name="",reference_ordinal=1,max_pixels=MAX_IMAGE_PIXELS,max_bytes=maximum)
             self.assertEqual(caught.exception.code,"SEEDANCE_IMAGE_BYTE_LIMIT")
-        self.assertEqual(MAX_IMAGE_BYTES,30*1024*1024)
+        self.assertEqual(MAX_IMAGE_BYTES,30_000_000)
 
     def test_invalid_truncated_and_unsupported_media_cannot_be_published(self):
         malformed = (b"",b"not an image",b"<svg></svg>",image_bytes("PNG")[:-14],image_bytes("JPEG")[:45],image_bytes("WEBP")[:-1])
@@ -178,6 +178,22 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
         sys.modules[spec.name] = cls.fixture
         spec.loader.exec_module(cls.fixture)
 
+    def setUp(self):
+        import HMBImageAssetLibrary as image_assets
+
+        self.temporary = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        projects = self.temporary / "Projects"
+        self.project = projects / "katuri8" / "Ai_Ct_image"
+        self.manifest = self.project / ".json" / image_assets.MANIFEST_NAMES[0]
+        self.manifest.parent.mkdir(parents=True)
+        self.enterContext(patch.object(image_assets, "_PREVIOUS_PROJECTS_ROOT", projects.as_posix()))
+
+    def register_images(self, paths):
+        self.manifest.write_text(json.dumps({"assets": [
+            {"path": path.relative_to(self.project).as_posix(), "asset_id": path.stem, "image_name": path.stem}
+            for path in paths
+        ]}), encoding="utf-8")
+
     def tearDown(self):
         while self.fixture.base.TEMPORARIES:
             self.fixture.base.TEMPORARIES.pop().cleanup()
@@ -199,81 +215,90 @@ class SeedanceImagePipelineIntegrationRegression(unittest.TestCase):
             )
         return batch
 
-    def test_five_oversized_third_local_images_fail_before_cloud_or_billable_post(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            folder = Path(temporary)
-            good = folder / "character.png"
-            good.write_bytes(image_bytes("PNG", 32, 16))
-            bad = folder / "oversized-background.png"
-            stream = BytesIO()
-            with Image.new("L", (8602, 4301), 0) as image:
-                image.save(stream, format="PNG")
-            bad.write_bytes(stream.getvalue())
-            before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (good, bad)}
-            batch = self.batch([str(good), str(good), str(bad)])
-            asyncio.run(batch.execute())
-            messages = []
-            for node in batch.nodes:
-                self.assertIs(node.results[-1]["was_successful"], False)
-                message = node.results[-1]["result_details"]
-                self.assertIn("SEEDANCE_IMAGE_PIXEL_LIMIT", message)
-                self.assertIn("참조 이미지 3번 (oversized-background.png)", message)
-                self.assertIn("36,997,202", message)
-                self.assertIn("36,000,000", message)
-                messages.append(message)
-                self.assertEqual(node.bridge.posts, [])
-                self.assertEqual(node._temporary_video_uploads, [])
-                node._create_gt_cloud_storage_driver.assert_not_called()
-            self.assertEqual(len(set(messages)), 1)
-            self.assertEqual({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (good, bad)}, before)
+    def test_five_oversized_third_registered_images_fail_before_cloud_or_billable_post(self):
+        good = self.project / "character.png"
+        good.write_bytes(image_bytes("PNG", 32, 16))
+        bad = self.project / "oversized-background.png"
+        stream = BytesIO()
+        with Image.new("L", (8602, 4301), 0) as image:
+            image.save(stream, format="PNG")
+        bad.write_bytes(stream.getvalue())
+        self.register_images((good, bad))
+        before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (good, bad)}
+        batch = self.batch([str(good), str(good), str(bad)])
+        asyncio.run(batch.execute())
+        messages = []
+        for node in batch.nodes:
+            self.assertIs(node.results[-1]["was_successful"], False)
+            message = node.results[-1]["result_details"]
+            self.assertNotIn("SEEDANCE_IMAGE_PIXEL_LIMIT", message)
+            self.assertIn("가로·세로 300~6,000px", message)
+            self.assertIn("참조 이미지 3번 (oversized-background.png)", message)
+            self.assertIn("36,997,202", message)
+            self.assertIn("36,000,000", message)
+            messages.append(message)
+            self.assertEqual(node.bridge.posts, [])
+            self.assertEqual(node._temporary_video_uploads, [])
+            node._create_gt_cloud_storage_driver.assert_not_called()
+        self.assertEqual(len(set(messages)), 1)
+        self.assertEqual({path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (good, bad)}, before)
 
-    def test_five_valid_local_images_submit_original_bytes_without_mutation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            folder = Path(temporary)
-            paths = [folder / ("image-" + str(number) + ".png") for number in range(1, 4)]
-            contents = [image_bytes("PNG", 32 + number, 16 + number) for number in range(1, 4)]
-            for path, content in zip(paths, contents):
-                path.write_bytes(content)
-            batch = self.batch(list(map(str, paths)))
-            before = [deepcopy(node.values) for node in batch.nodes]
-            asyncio.run(batch.execute())
-            keys = []
-            for node, authored in zip(batch.nodes, before):
-                self.assertIs(node.results[-1]["was_successful"], True, node.results[-1])
-                self.assertEqual(len(node.bridge.posts), 1)
-                wire = node.bridge.posts[0]
-                self.assertEqual(len(wire["image_urls"]), 3)
-                for url, original in zip(wire["image_urls"], contents):
-                    self.assertEqual(url, "https://storage.example/" + hashlib.sha256(original).hexdigest())
-                self.assertEqual(node.values, authored)
-                keys.append(wire["client_request_id"])
-            self.assertEqual(len(set(keys)), 5)
-            self.assertEqual([path.read_bytes() for path in paths], contents)
+    def test_five_valid_registered_images_submit_original_bytes_without_mutation(self):
+        paths = [self.project / ("image-" + str(number) + ".png") for number in range(1, 4)]
+        contents = [image_bytes("PNG", 32 + number, 16 + number) for number in range(1, 4)]
+        for path, content in zip(paths, contents):
+            path.write_bytes(content)
+        self.register_images(paths)
+        batch = self.batch(list(map(str, paths)))
+        before = [deepcopy(node.values) for node in batch.nodes]
+        asyncio.run(batch.execute())
+        keys = []
+        for node, authored in zip(batch.nodes, before):
+            self.assertIs(node.results[-1]["was_successful"], True, node.results[-1])
+            self.assertEqual(len(node.bridge.posts), 1)
+            wire = node.bridge.posts[0]
+            self.assertEqual(len(wire["image_urls"]), 3)
+            for url, original in zip(wire["image_urls"], contents):
+                self.assertEqual(url, "https://storage.example/" + hashlib.sha256(original).hexdigest())
+            self.assertEqual(node.values, authored)
+            keys.append(wire["client_request_id"])
+        self.assertEqual(len(set(keys)), 5)
+        self.assertEqual([path.read_bytes() for path in paths], contents)
 
     def test_invalid_data_uri_fails_before_cloud_or_billable_post(self):
-        valid = "data:image/png;base64," + base64.b64encode(image_bytes("PNG")).decode("ascii")
+        good = self.project / "character.png"
+        good.write_bytes(image_bytes("PNG"))
+        self.register_images((good,))
         invalid = "data:image/png;base64," + base64.b64encode(b"not an image").decode("ascii")
-        batch = self.batch([valid, valid, invalid])
+        batch = self.batch([str(good), str(good), invalid])
         asyncio.run(batch.execute())
         for node in batch.nodes:
             self.assertIs(node.results[-1]["was_successful"], False)
-            self.assertIn("SEEDANCE_IMAGE_INVALID", node.results[-1]["result_details"])
-            self.assertIn("참조 이미지 3번", node.results[-1]["result_details"])
+            message = node.results[-1]["result_details"]
+            self.assertIn("소스 누락: 서버 프로젝트에 등록된 원본", message)
+            self.assertIn("참조 이미지 3 (파일명 미제공)", message)
+            self.assertNotIn(invalid, message)
             self.assertEqual(node.bridge.posts, [])
             node._create_gt_cloud_storage_driver.assert_not_called()
 
-    def test_https_reference_keeps_local_error_ordinal_and_does_not_fetch_remote_image(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "third-reference.png"
-            path.write_bytes(png_header(8602, 4301))
-            valid = "data:image/png;base64," + base64.b64encode(image_bytes("PNG")).decode("ascii")
-            batch = self.batch(["https://cdn.example/first.png", valid, str(path)])
-            asyncio.run(batch.execute())
-            for node in batch.nodes:
-                self.assertIs(node.results[-1]["was_successful"], False)
-                self.assertIn("참조 이미지 3번 (third-reference.png)", node.results[-1]["result_details"])
-                self.assertEqual(node.bridge.posts, [])
-                node._create_gt_cloud_storage_driver.assert_not_called()
+    def test_https_reference_fails_at_original_gate_before_any_media_fetch(self):
+        good = self.project / "character.png"
+        good.write_bytes(image_bytes("PNG"))
+        self.register_images((good,))
+        url = "https://cdn.example/third-reference.png?signature=fixture-secret"
+        batch = self.batch([str(good), str(good), url])
+        for node in batch.nodes:
+            node._cloud_reference_source = unittest.mock.Mock(side_effect=AssertionError("Media fetch was not authorized"))
+        asyncio.run(batch.execute())
+        for node in batch.nodes:
+            self.assertIs(node.results[-1]["was_successful"], False)
+            message = node.results[-1]["result_details"]
+            self.assertIn("참조 이미지 3 (third-reference.png)", message)
+            self.assertIn("소스 누락: 서버 프로젝트에 등록된 원본", message)
+            self.assertNotIn("fixture-secret", message)
+            self.assertEqual(node.bridge.posts, [])
+            node._cloud_reference_source.assert_not_called()
+            node._create_gt_cloud_storage_driver.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -204,16 +204,14 @@ export function hmbAgentShotAccent(state) {
 }
 
 function hmbAgentShotOptionLabel(item) {
-  return item.only
-    ? "Only"
-    : `${String(item.number).padStart(2, "0")} · ${item.name || `Shot ${item.number}`}`;
+  return `${String(item.number).padStart(2, "0")} · ${item.name || `Shot ${item.number}`}`;
 }
 
 function hmbAgentShotOptionsMarkup(state) {
   const options = hmbAgentShotOptions(state);
   const current = state.shot.channel_uuid && state.shot.shot_uuid
     ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}`
-    : "__hmb_only__";
+    : "";
   return options.map((item) => {
     const label = hmbAgentShotOptionLabel(item);
     return `<option value="${hmbAgentEscape(item.key)}"${item.key === current ? " selected" : ""}>${hmbAgentEscape(label)}</option>`;
@@ -236,7 +234,7 @@ export function hmbSyncAgentShotSelect(select, state) {
   if (changed) select.innerHTML = hmbAgentShotOptionsMarkup(state);
   const expected = state.shot.channel_uuid && state.shot.shot_uuid
     ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}`
-    : "__hmb_only__";
+    : "";
   if (String(select.value || "") !== expected) select.value = expected;
   return changed;
 }
@@ -262,11 +260,16 @@ function hmbAgentExecutionStatus(phase) {
   })[String(phase || "")] || "";
 }
 
+function hmbAgentDashboardStatus(state) {
+  return hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase))
+    || (state.shot.shot_uuid ? "" : "ImageAsset 샷이 연결된 HMBPrompt를 선택하세요");
+}
+
 export function hmbAgentWidgetHeight(state) { return state?.manual_rebind?.required ? 144 : 64; }
 
 function renderAgentDashboard(state, container) {
   const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
-  const executionStatus = hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase));
+  const executionStatus = hmbAgentDashboardStatus(state);
   const height = hmbAgentWidgetHeight(state);
   return `
     <style>
@@ -286,8 +289,6 @@ function renderAgentDashboard(state, container) {
       .hmb-agent-dashboard .agent-rebind-panel>span{flex:1 0 100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#FBBF24}
       .hmb-agent-dashboard .agent-rebind-select{flex:1;min-width:100px;height:32px;border:1px solid var(--hmb-chip-line);border-radius:6px;background:#0b1020;color:var(--hmb-text)}
       .hmb-agent-dashboard .agent-rebind-confirm{height:32px;border:1px solid var(--hmb-chip-line);border-radius:6px;background:var(--hmb-chip-bg);color:var(--hmb-text);padding:0 10px}
-      .hmb-agent-dashboard .agent-only-toggle{flex:0 0 auto;height:29px;padding:0 10px;border:1px solid var(--hmb-chip-line);border-radius:7px;background:var(--hmb-chip-bg);color:var(--hmb-chip-text);font:inherit;font-size:10px;font-weight:850}
-      .hmb-agent-dashboard .agent-only-toggle[aria-pressed="true"]{box-shadow:0 0 10px var(--hmb-chip-glow);border-color:var(--hmb-shot-accent)}
       .hmb-agent-dashboard .agent-shot-row{--hmb-shot-accent:#F472B6;--row-rgb:244,114,182;display:flex;align-items:center;gap:6px;height:42px;border-top:1px solid rgba(var(--row-rgb),.35);background:linear-gradient(90deg,rgba(var(--row-rgb),.12),transparent);border-radius:5px}
       .hmb-agent-dashboard .agent-shot-row[data-shot-number="2"]{--hmb-shot-accent:#3B82F6;--row-rgb:59,130,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="3"]{--hmb-shot-accent:#10B981;--row-rgb:16,185,129}.hmb-agent-dashboard .agent-shot-row[data-shot-number="4"]{--hmb-shot-accent:#8B5CF6;--row-rgb:139,92,246}.hmb-agent-dashboard .agent-shot-row[data-shot-number="5"]{--hmb-shot-accent:#EAB308;--row-rgb:234,179,8}
       .hmb-agent-dashboard .agent-shot-row[data-active="true"]{box-shadow:inset 3px 0 var(--hmb-shot-accent);background:linear-gradient(90deg,rgba(var(--row-rgb),.23),rgba(var(--row-rgb),.04))}
@@ -338,21 +339,19 @@ function hmbRefreshAgentDashboard(container, props) {
   const paletteShotNumber = hmbAgentDisplayShotNumber(container, state);
   const error = container.__hmbAgentShotChangeError || "";
   const signature = JSON.stringify([paletteShotNumber, state.execution_phase, state.execution_stage, state.execution_elapsed_seconds, error,
-    state.shot_manager, state.only_mode, state.shot, state.shot_catalog,state.manual_rebind,
+    state.shot_manager, state.shot, state.shot_catalog,state.manual_rebind,
     container.__hmbAgentManualPending?.request_id,container.__hmbAgentManualError]);
   if (root.__hmbAgentPresentationSignature === signature) return true;
   root.__hmbAgentPresentationSignature = signature;
-  const toggle = root.querySelector?.(".agent-only-toggle");
-  if (toggle) { toggle.setAttribute("aria-pressed", String(state.only_mode)); toggle.disabled = Boolean(state.execution_phase); }
   hmbAgentSetAttribute(root,"data-shot-number",String(paletteShotNumber));
   hmbAgentSetAttribute(root,"data-hmb-managed-shot",String(Boolean(state.shot?.shot_uuid)));
   hmbAgentSetAttribute(root,"data-execution-phase",state.execution_phase || "");
   const select = root.querySelector?.(".agent-shot-select");
   if (select) {
     hmbSyncAgentShotSelect(select, state);
-    select.style.display = state.shot_manager || state.only_mode ? "none" : "";
+    select.style.display = state.shot_manager ? "none" : "";
   }
-  const executionStatus = hmbAgentProgressLabel(state, hmbAgentExecutionStatus(state.execution_phase));
+  const executionStatus = hmbAgentDashboardStatus(state);
   hmbRefreshManualAgentRebind(container,state);
   hmbSetAgentStatus(
     container,
@@ -380,7 +379,7 @@ function hmbRefreshManualAgentRebind(container,state){
 
 function hmbAgentShotKey(state) {
   return state?.shot?.shot_uuid
-    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : "__hmb_only__";
+    ? `${state.shot.channel_uuid}\u001f${state.shot.shot_uuid}` : "";
 }
 
 function hmbAgentResolveShotEcho(container, incomingProps) {
@@ -404,7 +403,7 @@ function hmbAgentResolveShotEcho(container, incomingProps) {
     delete container.__hmbAgentPendingShot;
     return { props: incomingProps, stale: false };
   }
-  const targetAvailable = pending.targetKey === "__hmb_only__" || (catalog.shots || []).some(
+  const targetAvailable = (catalog.shots || []).some(
     (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pending.targetKey,
   );
   const previousModeEcho = incomingKey === pending.targetKey && incoming.shot_manager !== pending.targetMode;
@@ -412,7 +411,7 @@ function hmbAgentResolveShotEcho(container, incomingProps) {
     delete container.__hmbAgentPendingShot;
     return { props: incomingProps, stale: false };
   }
-  const retained = { ...incoming, shot_catalog: catalog, shot: selected.shot, shot_manager:selected.shot_manager, only_mode:selected.only_mode };
+  const retained = { ...incoming, shot_catalog: catalog, shot: selected.shot, shot_manager:selected.shot_manager };
   return {
     props: { ...incomingProps, value: retained, parameterValue: retained, defaultValue: retained },
     stale: true,
@@ -613,9 +612,7 @@ function hmbNativeUiImplementation(container, props) {
     }
     const previousProps = liveProps;
     const next = requestedState || hmbAgentState(liveProps);
-    if (!requestedState) next.shot = option.only ? {
-      channel_uuid: "", shot_uuid: "", number: 1, name: "Only",
-    } : {
+    if (!requestedState) next.shot = {
       channel_uuid: option.channel_uuid,
       shot_uuid: option.shot_uuid,
       number: option.number,

@@ -25,7 +25,6 @@ import urllib.error
 import urllib.request
 import webbrowser
 import weakref
-from collections import OrderedDict
 from collections.abc import Generator, Iterator
 from contextlib import ExitStack, asynccontextmanager, closing, contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
@@ -161,7 +160,7 @@ import _hmb_review as _review
 import _hmb_broker_config as _broker_config
 import _hmb_my_box_node as _my_box_node
 import _hmb_reference_leases as _reference_leases
-from _hmb_image_limits import SeedanceImageLimitError, inspect_seedance_image_payload
+from _hmb_image_limits import MAX_IMAGE_BYTES, SeedanceImageLimitError, inspect_seedance_image_payload
 from _hmb_project import project_display_name, resolve_routing_project as resolve_project
 from _hmb_build_diagnostics import get_build_diagnostics as _get_build_diagnostics
 import _hmb_broker_transport as _broker_transport
@@ -669,13 +668,7 @@ MAX_REFERENCE_IMAGES = 30
 MAX_VIDEO_REFERENCES = 10
 MAX_REFERENCE_AUDIO = 10
 LEGACY_VIDEO_REFERENCE_SLOTS = 3
-MAX_IMAGE_BYTES = 30 * 1024 * 1024
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
-SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD = 2 * 1024 * 1024
-_LARGE_REFERENCE_PNG_BYTES = 8 * 1024 * 1024
-_PACKED_IMAGE_CACHE_BYTES = 48 * 1024 * 1024
-_PACKED_IMAGE_CACHE: OrderedDict[bytes, bytes] = OrderedDict()
-_PACKED_IMAGE_CACHE_LOCK = threading.Lock()
 SEEDANCE_REFERENCE_VIDEO_COPY_RATE = 5_000_000
 SEEDANCE_REFERENCE_VIDEO_COPY_THRESHOLD = 8_000_000
 MAX_DOWNLOAD_BYTES = 1024 * 1024 * 1024
@@ -2934,6 +2927,10 @@ class _HMBAIBrokerBridge(_BrokerTransport):
 
 class LocalReferenceVideoError(RuntimeError):
     """A selected local/project video cannot be resolved or read."""
+
+
+class _MediaDownloadSizeLimitError(RuntimeError):
+    """A media response exceeded the configured download byte limit."""
 
 
 class _AgentResultUnavailable(RuntimeError):
@@ -9381,6 +9378,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not subscription["enabled"]:
             resolved = dict(params)
             resolved["prompt"] = str(params.get("prompt") or "")
+            resolved.pop("_hmb_shot_image_sources", None)
             # Only has no exact Shot finishing source. Discard a previous
             # bound-Shot transient sidecar without touching authored text.
             resolved["_hmb_finish_look_out"] = ""
@@ -9462,6 +9460,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         images: list[str] = []
         videos: list[str] = []
+        image_sources: list[dict[str, Any]] = []
         draft_source_bindings: dict[str, str] = {}
         for source_node, source_kind in (
             (image_node, "image_asset"),
@@ -9525,9 +9524,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             ]
             if source_kind == "image_asset":
                 images = selected_media
+                metadata_by_uid = {
+                    record["source_uid"]: record["metadata"] for record in source_snapshot["ordered_assets"]
+                }
+                image_sources = [
+                    {"source_uid": uid, "source": media, "metadata": metadata_by_uid[uid]}
+                    for uid, media in zip(source_shot["selected_source_uids"], selected_media, strict=True)
+                ]
             else:
                 videos = selected_media
-        from _hmb_analysis_delivery import route_analysis_media, analysis_video_reference_bindings
+        from _hmb_analysis_delivery import analysis_video_reference_bindings, reference_identity, route_analysis_media
 
         originals, excluded = [], {}
         analysis_results_only = False
@@ -9554,6 +9560,17 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError("The selected Shot's analysis original references are invalid. No request was submitted.")
         images, image_bindings = route_analysis_media("image", images, excluded.get("images", ()),
             originals)
+        image_tokens = {f"@image{slot}": reference_identity(path) for slot, path in enumerate(images, 1)}
+        routed_slots = {row["shot_reference"]: row["provider_reference"] for row in image_bindings}
+        excluded_images = {reference_identity(path) for path in excluded.get("images", ()) if isinstance(path, str) and path}
+        for slot, record in enumerate(image_sources, 1):
+            shot_reference = f"@image{slot}"
+            provider_reference = routed_slots.get(shot_reference, shot_reference)
+            identity = reference_identity(record["source"])
+            if provider_reference and image_tokens.get(provider_reference) != identity:
+                raise ValueError(f"Shot image {slot} no longer matches its rendered reference. No request was submitted.")
+            record.update(shot_reference=shot_reference, provider_reference=provider_reference,
+                          analysis_excluded=identity in excluded_images)
         videos, video_bindings = route_analysis_media("video", videos, excluded.get("videos", ()),
             originals)
         image_limit, video_limit, audio_limit = MODEL_REFERENCE_LIMITS.get(
@@ -9644,6 +9661,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         resolved["first_frame"] = None
         resolved["last_frame"] = None
         resolved["reference_images"] = list(images)
+        resolved["_hmb_shot_image_sources"] = image_sources
         resolved["video_references"] = list(videos)
         resolved["video_reference_slots"] = []
         resolved["reference_audio"] = []
@@ -11398,6 +11416,24 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError("Finalize Draft requires a completed LOCAL Broker Draft job ID (job-...).")
         return action
 
+    def _registered_image_inputs(self, params: dict[str, Any]) -> dict[str, Any]:
+        from HMBImageAssetLibrary import require_registered_shared_image
+
+        def checked(field, index, value):
+            try:
+                return str(require_registered_shared_image(str(self._coerce_reference_value(value))))
+            except ValueError as exc:
+                name = self._reference_display_filename(value)
+                raise ValueError(f"{field} {index} ({name}) · {exc}") from exc
+
+        result = dict(params)
+        for field in ("first_frame", "last_frame"):
+            if self._has_reference_value(params.get(field)):
+                result[field] = checked(field, 1, params[field])
+        result["reference_images"] = [checked("참조 이미지", index, value)
+                                      for index, value in enumerate(params["reference_images"], 1)]
+        return result
+
     def _validate_parameters(self, params: dict[str, Any]) -> None:
         poll_interval = params["poll_interval_seconds"]
         timeout = params["generation_timeout_seconds"]
@@ -11829,19 +11865,28 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError(f"Invalid base64 data in {kind} reference.") from exc
         if not decoded:
             raise ValueError(f"{kind.capitalize()} reference is empty.")
-        exceeds_limit = (
-            len(decoded) >= maximum if kind == "image" else len(decoded) > maximum
-        )
+        if kind == "image":
+            cls._check_reference_image_size(len(decoded))
+        exceeds_limit = kind != "image" and len(decoded) > maximum
         if exceeds_limit:
-            limit_mb = maximum // (1024 * 1024)
+            limit = f"{maximum:,} bytes" if kind == "image" else f"{maximum // (1024 * 1024)} MB"
             raise ValueError(
                 f"{kind.capitalize()} reference must be "
-                f"{'smaller than' if kind == 'image' else 'no larger than'} {limit_mb} MB."
+                f"{'smaller than' if kind == 'image' else 'no larger than'} {limit}."
             )
         if kind == "image":
             cls._validate_image_content(decoded, mime, reference_ordinal=reference_ordinal)
         encoded = base64.b64encode(decoded).decode("ascii")
         return f"data:{mime};base64,{encoded}"
+
+    @staticmethod
+    def _check_reference_image_size(size: int) -> None:
+        if size >= MAX_IMAGE_BYTES:
+            raise SeedanceImageLimitError(
+                "SEEDANCE_IMAGE_BYTE_LIMIT",
+                f"이미지는 {MAX_IMAGE_BYTES:,}바이트 미만이어야 합니다.",
+                {"bytes": size, "max_bytes_exclusive": MAX_IMAGE_BYTES},
+            )
 
     @staticmethod
     def _validate_image_content(content: bytes, mime: str, *, media_name: str = "",
@@ -11950,13 +11995,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         size = path.stat().st_size
         if size <= 0:
             raise ValueError(f"{kind.capitalize()} reference is empty: {path}")
-        exceeds_limit = size >= maximum if kind == "image" else size > maximum
+        if kind == "image":
+            cls._check_reference_image_size(size)
+        exceeds_limit = kind != "image" and size > maximum
         if exceeds_limit:
-            limit_mb = maximum // (1024 * 1024)
+            limit = f"{maximum:,} bytes" if kind == "image" else f"{maximum // (1024 * 1024)} MB"
             raise ValueError(
                 f"{kind.capitalize()} reference must be "
                 f"{'smaller than' if kind == 'image' else 'no larger than'} "
-                f"{limit_mb} MB: {path.name}"
+                f"{limit}: {path.name}"
             )
         base64_size = 4 * ((size + 2) // 3)
         mime_size = max(map(len, ALLOWED_IMAGE_MIMES)) if kind == "image" else len(mime)
@@ -11986,12 +12033,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "FN AI Broker request body exceeds the 64 MB limit. "
                 "Reduce or externally host reference media."
             )
-        for _field, kind, values in reference_fields:
-            for value in values:
+        for field, kind, values in reference_fields:
+            for index, value in enumerate(values, 1):
                 # Each placeholder already contributed the two quote bytes.
-                projected_bytes += (
-                    cls._projected_prepared_reference_json_bytes(kind, value) - 2
-                )
+                try:
+                    projected_bytes += cls._projected_prepared_reference_json_bytes(kind, value) - 2
+                except (ValueError, OSError) as exc:
+                    if kind != "image":
+                        raise
+                    raise cls._reference_intake_error(field, kind, index, cls._reference_display_filename(value), exc) from exc
                 if projected_bytes > MAX_REQUEST_BYTES:
                     raise ValueError(
                         "FN AI Broker request body exceeds the 64 MB limit. "
@@ -12059,13 +12109,15 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         size = path.stat().st_size
         if size <= 0:
             raise ValueError(f"{kind.capitalize()} reference is empty: {path}")
-        exceeds_limit = size >= maximum if kind == "image" else size > maximum
+        if kind == "image":
+            cls._check_reference_image_size(size)
+        exceeds_limit = kind != "image" and size > maximum
         if exceeds_limit:
-            limit_mb = maximum // (1024 * 1024)
+            limit = f"{maximum:,} bytes" if kind == "image" else f"{maximum // (1024 * 1024)} MB"
             raise ValueError(
                 f"{kind.capitalize()} reference must be "
                 f"{'smaller than' if kind == 'image' else 'no larger than'} "
-                f"{limit_mb} MB: {path.name}"
+                f"{limit}: {path.name}"
             )
         try:
             if kind == "image":
@@ -12076,6 +12128,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             raise ValueError(
                 f"{kind.capitalize()} reference cannot be read: {path}"
             ) from exc
+
+    def _prepare_image_payload_reference(self, field: str, slot: int, value: Any) -> str:
+        try:
+            return self._prepare_media_reference("image", value)
+        except (ValueError, OSError) as exc:
+            raise self._reference_intake_error(field, "image", slot, self._reference_display_filename(value), exc) from exc
 
     @staticmethod
     def _get_optional_secret(name: str) -> str:
@@ -12376,11 +12434,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         size = path.stat().st_size
         if size <= 0:
             raise ValueError(f"Image reference is empty: {path}")
-        if size >= MAX_IMAGE_BYTES:
-            raise ValueError(
-                f"Image reference must be smaller than "
-                f"{MAX_IMAGE_BYTES // (1024 * 1024)} MB: {path.name}"
-            )
+        cls._check_reference_image_size(size)
         try:
             return cls._read_validated_local_image(path, mime, reference_ordinal)
         except OSError as exc:
@@ -12424,7 +12478,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         return url
 
     def _upload_cloud_reference_bytes(
-        self, driver: Any, content: bytes, filename: str, *, cloud_proof_v1: bool = False,
+        self, driver: Any, content: bytes, filename: str, *,
+        cloud_proof_v1: bool = False, content_type: str | None = None,
     ) -> str:
         remote_path = Path("artifact_url_storage") / uuid4().hex / filename
         self._temporary_video_uploads.append((driver, remote_path))
@@ -12452,11 +12507,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         if method not in {"PUT", "POST"}:
             raise RuntimeError("Griptape Cloud returned an invalid upload method.")
-        headers = {
-            str(key): str(header_value)
-            for key, header_value in dict(upload.get("headers") or {}).items()
-            if str(key).lower() != "content-length"
-        }
+        signed_headers = dict(upload.get("headers") or {})
+        signed_header_names = {str(key).lower() for key in signed_headers}
+        azure_upload = method == "PUT" and (
+            (urlparse(upload_url).hostname or "").endswith(".blob.core.windows.net")
+            or "x-ms-blob-type" in signed_header_names
+        )
+        headers = {str(key): str(value) for key, value in signed_headers.items()}
+        if content_type and azure_upload and "authorization" not in signed_header_names:
+            # SAS URLs keep their original signature. Azure persists the explicit blob MIME.
+            blob_type_headers = {"content-type", "x-ms-blob-content-type"}
+            headers = {key: value for key, value in headers.items() if key.lower() not in blob_type_headers}
+            headers.update({"Content-Type": content_type, "x-ms-blob-content-type": content_type})
+        headers = {key: value for key, value in headers.items() if key.lower() != "content-length"}
         headers["Content-Length"] = str(len(content))
         response = httpx.request(
             method,
@@ -12595,44 +12658,6 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         )
         return signed_url
 
-    @staticmethod
-    def _compact_seedance_png_reference(content: bytes) -> tuple[bytes, str]:
-        """Encode a smaller transport copy without changing pixel values."""
-        from io import BytesIO
-        from PIL import Image
-
-        key = hashlib.sha256(content).digest()
-        with _PACKED_IMAGE_CACHE_LOCK:
-            packed = _PACKED_IMAGE_CACHE.get(key)
-            if packed is not None:
-                _PACKED_IMAGE_CACHE.move_to_end(key)
-                return packed, "image/webp"
-        try:
-            with Image.open(BytesIO(content)) as image:
-                if image.mode not in {"RGB", "RGBA"} or getattr(image, "is_animated", False):
-                    return content, "image/png"
-                with BytesIO() as buffer:
-                    method = 1 if len(content) >= _LARGE_REFERENCE_PNG_BYTES else 0
-                    image.save(buffer, format="WEBP", lossless=True, exact=True, method=method,
-                               icc_profile=image.info.get("icc_profile") or b"",
-                               exif=image.info.get("exif") or b"")
-                    if buffer.tell() < len(content):
-                        packed = buffer.getvalue()
-                        # Store only encoded bytes. The next run must still read
-                        # and validate its selected source before looking it up.
-                        with _PACKED_IMAGE_CACHE_LOCK:
-                            _PACKED_IMAGE_CACHE[key] = packed
-                            _PACKED_IMAGE_CACHE.move_to_end(key)
-                            total = sum(map(len, _PACKED_IMAGE_CACHE.values()))
-                            while total > _PACKED_IMAGE_CACHE_BYTES or len(_PACKED_IMAGE_CACHE) > 64:
-                                _, oldest = _PACKED_IMAGE_CACHE.popitem(last=False)
-                                total -= len(oldest)
-                        return packed, "image/webp"
-        except (OSError, ValueError, KeyError):
-            # Optional lossless packing can fall back to the already validated PNG.
-            pass
-        return content, "image/png"
-
     @contextmanager
     def _cloud_reference_source(self, kind: str, value: Any) -> Iterator[str]:
         text = str(self._coerce_reference_value(value)).strip()
@@ -12643,7 +12668,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return
 
         # Do not forward a third-party link or a private authorization header to Ark.
-        limits = {"image": MAX_IMAGE_BYTES, "video": MAX_DOWNLOAD_BYTES, "audio": MAX_AUDIO_BYTES}
+        limits = {"image": MAX_IMAGE_BYTES - 1, "video": MAX_DOWNLOAD_BYTES, "audio": MAX_AUDIO_BYTES}
         suffix = Path(urlparse(text).path).suffix.lower()
         with TemporaryDirectory(prefix="hmb-cloud-input-") as folder:
             path = Path(folder) / "reference"
@@ -12654,6 +12679,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         media_label=f"Reference {kind}", destination=stream,
                     ))
                 except (ValueError, OSError, RuntimeError, httpx.HTTPError) as exc:
+                    if kind == "image" and isinstance(exc, _MediaDownloadSizeLimitError):
+                        raise
                     raise ConnectionError("참조 파일 다운로드 실패") from exc
             if kind == "image":
                 suffix = suffix if suffix in IMAGE_MIME_BY_SUFFIX else ".png"
@@ -12699,13 +12726,41 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-    def _prepare_cloud_image(self, source: str, model: str, ordinal: int) -> tuple[bytes, str]:
-        content, mime, name = self._read_image_for_cloud_upload(source, reference_ordinal=ordinal)
-        if model == SEEDANCE_2_5_MODEL_ID and mime == "image/png" and len(content) >= SEEDANCE_LOSSLESS_PNG_COPY_THRESHOLD:
-            content, mime = self._compact_seedance_png_reference(content)
-            if mime == "image/webp":
-                name = Path(name).with_suffix(".webp").name
-        return content, name
+    @classmethod
+    def _reference_display_filename(cls, value: Any) -> str:
+        name = ""
+        try:
+            raw = str(cls._coerce_reference_value(value))
+            if isinstance(value, dict):
+                name = value.get("filename") or value.get("file_name") or value.get("name") or ""
+            if not isinstance(name, str) or not name:
+                if raw.startswith(("http://", "https://", "asset://")):
+                    name = unquote(urlparse(raw).path.rsplit("/", 1)[-1])
+                elif not raw.startswith("data:") and "://" not in raw:
+                    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+        except (ValueError, TypeError, UnicodeError):
+            name = ""
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[\w .()+\[\]-]{1,150}\.(?:png|jpe?g|webp|gif|bmp|tiff?|avif|heic|exr|"
+            r"mp4|mov|m4v|webm|mkv|avi|wav|mp3|aac|flac|m4a|ogg|aiff?)", name, re.IGNORECASE,
+        ):
+            name = "파일명 미제공"
+        return name
+
+    @classmethod
+    def _reference_intake_error(
+        cls, field: str, kind: str, slot: int, name: str, exc: Exception,
+    ) -> ValueError:
+        title = {"first_frame": "첫 프레임", "last_frame": "마지막 프레임",
+                 "image_urls": "참조 이미지", "video_urls": "참조 영상", "audio_urls": "참조 오디오"}[field]
+        if field.endswith("_urls"):
+            title = f"{title} {slot}번"
+        message = f"{title} ({name}) · {cls._reference_intake_guidance(kind, exc)}"
+        if isinstance(exc, SeedanceImageLimitError):
+            return SeedanceImageLimitError(exc.code, message, exc.details)
+        if kind == "image" and isinstance(exc, _MediaDownloadSizeLimitError):
+            return SeedanceImageLimitError("SEEDANCE_IMAGE_BYTE_LIMIT", message, {})
+        return ValueError(message)
 
     @staticmethod
     def _reference_intake_guidance(kind: str, exc: Exception) -> str:
@@ -12713,8 +12768,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if code == "SEEDANCE_IMAGE_PIXEL_LIMIT":
             d = exc.details
             return (f"이미지는 {d['width']}×{d['height']} ({d['pixels']:,}픽셀)이며 한도는 {d['max_pixels']:,}픽셀입니다. "
-                    f"{d['suggested_width']}×{d['suggested_height']} 이하의 복사본을 첨부하세요.")
+                    f"가로·세로 300~6,000px, {d['max_pixels']:,}픽셀 이하로 줄인 복사본을 첨부하세요.")
         if code == "SEEDANCE_IMAGE_BYTE_LIMIT" or "smaller than" in str(exc) or "safety limit" in str(exc):
+            if kind == "image":
+                size = getattr(exc, "details", {}).get("bytes")
+                reason = f"파일 용량은 {size:,}바이트입니다." if isinstance(size, int) else "파일 용량이 한도를 초과했습니다."
+                return f"{reason} {MAX_IMAGE_BYTES:,}바이트 미만으로 줄인 복사본을 다시 첨부하세요."
             return "파일이 허용 용량을 초과합니다. 용량을 줄인 복사본을 첨부하세요."
         if code == "SEEDANCE_IMAGE_VALIDATOR_UNAVAILABLE" or "FFmpeg is not available" in str(exc):
             return "PC에 미디어 검사 도구가 없습니다. 도구를 복구한 뒤 같은 파일로 다시 시도하세요."
@@ -12728,7 +12787,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             return "asset:// ID만으로는 원본을 읽을 수 없습니다. 원본 파일이나 다운로드 주소를 연결하세요."
         if isinstance(exc, LocalReferenceVideoError) and "업로드 사본" in str(exc):
             return "업로드용 MP4 사본을 만들 수 없습니다. H.264 또는 HEVC로 재생되는 MP4/MOV 파일을 첨부하세요."
-        return {"image": "이미지를 읽을 수 없습니다. 열리는 이미지 파일을 이 슬롯에 다시 첨부하세요.",
+        return {"image": "이미지 픽셀을 읽을 수 없습니다. 파일을 정상적으로 열 수 있는지 확인한 뒤 PNG 또는 WebP로 다시 저장해 첨부하세요.",
                 "video": "영상 트랙을 읽을 수 없습니다. 재생되는 동영상 파일을 이 슬롯에 다시 첨부하세요.",
                 "audio": "음성 트랙을 읽을 수 없습니다. 재생되는 WAV 또는 MP3를 이 슬롯에 다시 첨부하세요."}[kind]
 
@@ -12754,7 +12813,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         with ExitStack() as scratch:
             # Acquire and check every input before issuing the first upload. Keep
             # video files open to the preparation scope and bound in-memory bytes.
-            prepared: dict[tuple[str, str], tuple[bytes | Path, str]] = {}
+            prepared: dict[tuple[str, str], tuple[bytes | Path, str, str | None]] = {}
             memory_left = MAX_IMAGE_BYTES
             spill_dir = None
             fields = (("first_frame", "image", images[:1]), ("last_frame", "image", images[1:2]),
@@ -12781,22 +12840,23 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     if kind == "video":
                         path = self._resolve_local_video_path(source)
                         staged = scratch.enter_context(self._reference_video_upload_path(path, model))
-                        prepared[key] = staged, staged.name
+                        prepared[key] = staged, staged.name, None
                         continue
                     if kind == "image":
-                        content, name = self._prepare_cloud_image(source, model, index + 1)
+                        content, mime, name = self._read_image_for_cloud_upload(source, reference_ordinal=index + 1)
                     else:
                         content, name = self._read_cloud_reference_audio(source)
+                        mime = None
                         self._check_reference_track(["-f", Path(name).suffix[1:].lower(), "-i", "pipe:0"], "a", content)
                     if len(content) <= memory_left:
-                        prepared[key] = content, name
+                        prepared[key] = content, name, mime
                         memory_left -= len(content)
                     else:
                         if spill_dir is None:
                             spill_dir = Path(scratch.enter_context(TemporaryDirectory(prefix="hmb-render-inputs-")))
                         staged = spill_dir / str(len(prepared))
                         staged.write_bytes(content)
-                        prepared[key] = staged, name
+                        prepared[key] = staged, name, mime
                     del content
                 except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, FileLoadError, httpx.HTTPError) as exc:
                     if display is None:
@@ -12809,15 +12869,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                 basename = raw.replace("\\", "/").rsplit("/", 1)[-1]
                                 if re.fullmatch(r"[\w .()+\[\]-]{1,150}\.[\w]{1,12}", basename):
                                     name = basename
-                    title = {"first_frame": "첫 프레임", "last_frame": "마지막 프레임",
-                             "image_urls": "참조 이미지", "video_urls": "참조 영상", "audio_urls": "참조 오디오"}[field]
-                    if field.endswith("_urls"):
-                        title = f"{title} {slot}번"
-                    action = self._reference_intake_guidance(kind, exc)
-                    message = f"{title} ({name}) · {action}"
-                    if isinstance(exc, SeedanceImageLimitError):
-                        raise SeedanceImageLimitError(exc.code, message, exc.details) from exc
-                    raise ValueError(message) from exc
+                    raise self._reference_intake_error(field, kind, slot, name, exc) from exc
             if prepared:
                 if cloud_driver is _CLOUD_DRIVER_UNSET:
                     cloud_driver = self._create_gt_cloud_storage_driver()
@@ -12829,7 +12881,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             def upload_once(kind: str, value: Any) -> str:
                 key = source_key(kind, value)
                 if key not in uploaded:
-                    blob, name = prepared.pop(key)
+                    blob, name, mime = prepared.pop(key)
                     if kind == "video":
                         remote = Path("artifact_url_storage") / uuid4().hex / name
                         self._temporary_video_uploads.append((cloud_driver, remote))
@@ -12838,7 +12890,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                     else:
                         content = blob.read_bytes() if isinstance(blob, Path) else blob
                         uploaded[key] = self._upload_cloud_reference_bytes(
-                            cloud_driver, content, name, cloud_proof_v1=cloud_proof_v1,
+                            cloud_driver, content, name, cloud_proof_v1=cloud_proof_v1, content_type=mime,
                         )
                 return uploaded[key]
 
@@ -12866,6 +12918,12 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         list_inputs = {"image_urls": "reference_images", "audio_urls": "reference_audio"}
         if not legacy_video_slots:
             list_inputs["video_urls"] = VIDEO_REFERENCES_PARAMETER
+        image_shot_slots = {}
+        for record in params.get("_hmb_shot_image_sources", ()):
+            if record["provider_reference"]:
+                image_shot_slots.setdefault(
+                    record["provider_reference"], int(record["shot_reference"].removeprefix("@image")),
+                )
         sources = {}
         for field, values in (
             ("first_frame", [params.get("first_frame")]), ("last_frame", [params.get("last_frame")]),
@@ -12882,23 +12940,9 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             for slot, value in enumerate(values, 1):
                 if not self._has_reference_value(value):
                     continue
-                name = ""
-                try:
-                    raw = str(self._coerce_reference_value(value))
-                    if isinstance(value, dict):
-                        name = value.get("filename") or value.get("file_name") or value.get("name") or ""
-                    if not isinstance(name, str) or not name:
-                        if raw.startswith(("http://", "https://", "asset://")):
-                            name = unquote(urlparse(raw).path.rsplit("/", 1)[-1])
-                        elif not raw.startswith("data:") and "://" not in raw:
-                            name = raw.replace("\\", "/").rsplit("/", 1)[-1]
-                except (ValueError, TypeError, UnicodeError):
-                    name = ""
-                if not isinstance(name, str) or not re.fullmatch(
-                    r"[\w .()+\[\]-]{1,150}\.(?:png|jpe?g|webp|gif|bmp|tiff?|avif|heic|exr|"
-                    r"mp4|mov|m4v|webm|mkv|avi|wav|mp3|aac|flac|m4a|ogg|aiff?)", name, re.IGNORECASE,
-                ):
-                    name = "파일명 미제공"
+                name = self._reference_display_filename(value)
+                if field == "image_urls":
+                    slot = image_shot_slots.get(f"@image{wire_index + 1}", slot)
                 sources[field, wire_index] = (slot, name)
                 wire_index += 1
         return sources
@@ -13214,16 +13258,16 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if input_mode == INPUT_MODE_FIRST_LAST_FRAME:
             if params["first_frame"]:
                 payload["first_frame"] = [
-                    self._prepare_media_reference("image", params["first_frame"])
+                    self._prepare_image_payload_reference("first_frame", 1, params["first_frame"])
                 ]
             if params["last_frame"]:
                 payload["last_frame"] = [
-                    self._prepare_media_reference("image", params["last_frame"])
+                    self._prepare_image_payload_reference("last_frame", 1, params["last_frame"])
                 ]
         elif input_mode == INPUT_MODE_MULTIMODAL_REFERENCES:
             payload["image_urls"] = [
-                self._prepare_media_reference("image", value)
-                for value in params["reference_images"]
+                self._prepare_image_payload_reference("image_urls", slot, value)
+                for slot, value in enumerate(params["reference_images"], 1)
             ]
             payload["video_urls"] = [
                 self._prepare_media_reference("video", value)
@@ -13782,7 +13826,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                                     f"{media_label} download returned an invalid Content-Length."
                                 ) from exc
                             if declared_length > max_bytes:
-                                raise RuntimeError(
+                                raise _MediaDownloadSizeLimitError(
                                     f"Downloaded {media_label.lower()} exceeds the safety limit."
                                 )
 
@@ -13800,7 +13844,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                         async for chunk in response.aiter_bytes():
                             received += len(chunk)
                             if received > max_bytes:
-                                raise RuntimeError(
+                                raise _MediaDownloadSizeLimitError(
                                     f"Downloaded {media_label.lower()} exceeds the safety limit."
                                 )
                             if destination is None:
@@ -15577,6 +15621,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             cloud_display_sources = {}
             if not draft_final:
                 self._assert_operation_project_selection()
+                params = await self._run_blocking_generation_stage(self._registered_image_inputs, params)
                 try:
                     self._hmb_review_inputs = await self._run_blocking_generation_stage(
                         _review.capture_inputs, params,
@@ -16122,24 +16167,34 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                              "source_type": "generator_reference"}
                             for index, value in enumerate(params.get("video_references") or [])]}
         origin = params.get("_hmb_generation_origin") or {}
-        for kind, records_key, destination in (("image_asset", "ordered_assets", media["images"]),
-                                               ("video_picker", "ordered_videos", media["videos"])):
-            raw = view._web_source_snapshots.get(kind, {})
-            shot = next((row for row in raw.get("shots", []) if row.get("shot_uuid") == origin.get("shot_uuid")), {})
-            metadata = {row.get("source_uid"): row.get("metadata", {}) for row in raw.get(records_key, [])}
-            for record, uid in zip(destination, shot.get("selected_source_uids", [])):
-                info = deepcopy(metadata.get(uid) or {})
-                record["identity"] = {"source_uid": uid}
-                for key in ("frame_metadata", "frame_domain", "source_type", "image_main_type", "image_sub_type",
-                            "video_main_type", "video_sub_type", "reference_scope", "frame_ranges", "control_role"):
-                    if key in info:
-                        record[key] = info[key]
-                role = str(info.get("generation_role") or info.get("video_role") or "").lower()
-                if kind == "video_picker" and "video_sub_type" not in record:
-                    subtype = {"original": "Original Preview", "mask": "Mask", "depth": "Depth",
-                               "motion_guide": "Motion Guide"}.get(role)
-                    if subtype:
-                        record["video_sub_type"] = subtype
+        image_by_token = {row["token"]: row for row in media["images"]}
+        for source in params.get("_hmb_shot_image_sources", ()):
+            record = image_by_token.get(source["provider_reference"])
+            if record is None or "identity" in record:
+                continue
+            record["identity"] = {"source_uid": source["source_uid"]}
+            info = source["metadata"]
+            for key in ("asset_id", "image_name", "width", "height", "source_type",
+                        "image_main_type", "image_sub_type", "custom_source_type", "scope_candidate",
+                        "frame_metadata", "frame_domain", "reference_scope", "frame_ranges", "control_role"):
+                if key in info:
+                    record[key] = deepcopy(info[key])
+        raw = view._web_source_snapshots.get("video_picker", {})
+        shot = next((row for row in raw.get("shots", []) if row.get("shot_uuid") == origin.get("shot_uuid")), {})
+        metadata = {row.get("source_uid"): row.get("metadata", {}) for row in raw.get("ordered_videos", [])}
+        for record, uid in zip(media["videos"], shot.get("selected_source_uids", [])):
+            info = deepcopy(metadata.get(uid) or {})
+            record["identity"] = {"source_uid": uid}
+            for key in ("frame_metadata", "frame_domain", "source_type", "image_main_type", "image_sub_type",
+                        "video_main_type", "video_sub_type", "reference_scope", "frame_ranges", "control_role"):
+                if key in info:
+                    record[key] = info[key]
+            role = str(info.get("generation_role") or info.get("video_role") or "").lower()
+            if "video_sub_type" not in record:
+                subtype = {"original": "Original Preview", "mask": "Mask", "depth": "Depth",
+                           "motion_guide": "Motion Guide"}.get(role)
+                if subtype:
+                    record["video_sub_type"] = subtype
         return {"schema": "hmb-web-rerender-generator-snapshot", "version": 1,
                 "project": {key: params[key] for key in ("project_id", "project_name")},
                 "target": target, "params": deepcopy(params), "media_snapshot": deepcopy(media),
@@ -16543,10 +16598,10 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 )
             if not self._runtime_node_is_live(require_registered=True):
                 return
-            self._set_status_results(
-                was_successful=False,
-                result_details=f"FAILURE: {safe_message}",
-            )
+            details = f"FAILURE: {safe_message}"
+            if isinstance(exc, SeedanceImageLimitError) and not generation_id:
+                details = safe_message.removeprefix(f"[{exc.code}] ")
+            self._set_status_results(was_successful=False, result_details=details)
             # A handled per-shot failure is a Failed result, not a global DAG
             # exception. Other shots (including their active polling) continue.
             logger.error("%s failed; independent shots continue: %s", self.name, safe_message)
@@ -16572,8 +16627,38 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 "reference_images", "video_references", "video_reference_slots", "reference_audio",
                 "_hmb_finish_look_out", "_hmb_draft_source_bindings", "_hmb_sound_snapshot", "_hmb_sound_tracks",
                 "_hmb_sound_provenance", "_hmb_sound_reference_bindings",
-                "_hmb_analysis_media_bindings", "_hmb_analysis_video_references")
+                "_hmb_analysis_media_bindings", "_hmb_analysis_video_references", "_hmb_shot_image_sources")
         return self._canonical_sha256({key: params.get(key) for key in keys})
+
+    @staticmethod
+    def _assert_prompt_shot_image_parity(document: Any, params: Mapping[str, Any]) -> None:
+        """Cross-check a new Prompt manifest against the Generator's selected images."""
+        if not isinstance(document, dict) or "required_registered_images" not in document:
+            return  # Older Prompt documents have no independent registration manifest.
+        from _hmb_analysis_delivery import reference_identity
+
+        def key(path):
+            return reference_identity(path) if isinstance(path, str) and path else None
+
+        sources = params.get("_hmb_shot_image_sources", ())
+        prompt_images = document.get("image_media")
+        required = document["required_registered_images"]
+        expected = [
+            (row["source_uid"], row["shot_reference"], key(row["source"]))
+            for row in sources
+            if row["metadata"].get("verified_asset") is True
+            and str(row["metadata"].get("source_kind") or "").casefold() == "project"
+            and not row["analysis_excluded"]
+        ]
+        if (not isinstance(prompt_images, list)
+                or [key(path) for path in prompt_images] != [key(row["source"]) for row in sources]
+                or not isinstance(required, list)
+                or any(not isinstance(row, dict) for row in required)
+                or [(row.get("source_uid"), row.get("token"), key(row.get("source"))) for row in required] != expected):
+            raise _AgentResultUnavailable(
+                "The Prompt and Generator received different images for this Shot. "
+                "Verify the ImageAsset binding and retry. No render was submitted."
+            )
 
     @staticmethod
     def _assert_managed_prompt_current(source, record, *, channel_uuid, shot_uuid):
@@ -16617,12 +16702,14 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         # exact source document before the Generator's own immutable-input
         # validation; this performs no Agent inference or video submission.
         prepare_api = getattr(source, "_hmb_prepare_shot_document", None)
+        prompt_document = None
         if callable(prepare_api):
-            await prepare_api(channel_uuid=channel, shot_uuid=shot, prompt_owner=prompt_owner,
+            prompt_document = await prepare_api(channel_uuid=channel, shot_uuid=shot, prompt_owner=prompt_owner,
                 lifecycle_generation=int(getattr(source, "_hmb_lifecycle_generation", 0) or 0), generator=self)
         # Validate project and direct source identity before any model call.
         # This validation copy is never persisted or submitted as a prompt.
         validation = self._resolve_exact_shot_generation_inputs(self._get_parameters())
+        HMBSeedanceGeneration._assert_prompt_shot_image_parity(prompt_document, validation)
         selection = validation.get("_hmb_imageasset_project_selection")
         if not isinstance(selection, dict):
             raise _AgentResultUnavailable("The selected Shot project is unavailable. No render was submitted.")

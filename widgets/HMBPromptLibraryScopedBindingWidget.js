@@ -2151,6 +2151,21 @@ export function hmbReleasePickerVideoSlotSuppression(state, rawSlot) {
   return true;
 }
 
+function normalizeAssetRegistration(value) {
+  if (!value || typeof value !== "object" || !clean(value.image_name)) return null;
+  const registration = {};
+  for (const key of ["image_name", "image_main_type", "image_sub_type", "source_type",
+    "custom_source_type", "scope_candidate"]) {
+    registration[key] = clean(value[key]);
+  }
+  const colors = Array.isArray(value.color_pick_candidates) ? value.color_pick_candidates : [];
+  registration.color_pick_candidates = [...new Set(colors.map(clean).filter(Boolean))];
+  for (const axis of ["width", "height"]) {
+    if (Number.isInteger(value[axis]) && value[axis] > 0) registration[axis] = value[axis];
+  }
+  return registration;
+}
+
 function normalizeImage(item, slot) {
   const out = defaultImage(slot);
   if (!item || typeof item !== "object") return hmbPromptCarrySourceIdentity(null, out, "image");
@@ -2189,6 +2204,10 @@ function normalizeImage(item, slot) {
     ? clean(item.asset_source_kind).toLowerCase()
     : "";
   out.asset_verified = Boolean(item.asset_verified && out.asset_source_kind === "project");
+  if (out.asset_verified && out.asset_managed) {
+    const registration = normalizeAssetRegistration(item.asset_registration);
+    if (registration) out.asset_registration = registration;
+  }
   out.image_main_type = clean(item.image_main_type);
   out.image_sub_type = clean(item.image_sub_type);
   out.source_type = clean(item.source_type) || out.source_type;
@@ -4829,6 +4848,24 @@ function hmbPromptImageTaxonomyIsVerified(item) {
   );
 }
 
+function hmbPromptUsesRegisteredImageDefault(item, field) {
+  if (!item?.asset_managed || !hmbPromptImageTaxonomyIsVerified(item)) return false;
+  const registration = item.asset_registration;
+  let defaultValue;
+  if (field === "image_sub_type") {
+    if (!registration && !clean(item.asset_image_main_type_candidate)) return false;
+    const candidate = registration?.image_sub_type ?? item.asset_image_sub_type_candidate;
+    defaultValue = candidate === "Analysis" ? "" : clean(candidate);
+  } else if (field === "custom_source_type") {
+    if (!registration) return false;
+    defaultValue = clean(registration.custom_source_type);
+  } else {
+    defaultValue = clean(item.asset_default_target);
+    if (!defaultValue) return false;
+  }
+  return clean(item[field]) === defaultValue;
+}
+
 function hmbPromptVideoHasAuthority(item) {
   return Boolean(
     item?.picker_managed
@@ -4900,8 +4937,12 @@ export function hmbMergePromptRevisionAxes(sourceState, uiState) {
       uiItem = uiImages.get(`image-uid:${item.asset_import_source_uid}`);
     }
     if (!uiItem) return;
-    hmbPromptCopyUiFields(item, uiItem, HMB_PROMPT_IMAGE_UI_FIELDS);
-    hmbPromptCopyUiFields(item, uiItem, ["image_sub_type", "custom_source_type"]);
+    const registrationChanged = item.asset_registration &&
+      JSON.stringify(item.asset_registration) !== JSON.stringify(uiItem.asset_registration);
+    const fields = [...HMB_PROMPT_IMAGE_UI_FIELDS, "image_sub_type", "custom_source_type"];
+    hmbPromptCopyUiFields(item, uiItem, registrationChanged ? fields.filter(field =>
+      !["owner", "image_sub_type", "custom_source_type"].includes(field) ||
+      !hmbPromptUsesRegisteredImageDefault(uiItem, field)) : fields);
     if (!hmbPromptImageHasAuthority(item)) {
       item.label = hmbPromptCloneRangeField(uiItem.label);
     }
@@ -6580,8 +6621,6 @@ function hmbApplyPromptDisabledFeedback(container, disabled) {
   }
 }
 
-export const HMB_PROMPT_ONLY_SHOT_VALUE = "__hmb_only__";
-
 export function hmbPromptVerifiedShotCatalog(state) {
   const routing = normalizeShotCatalogRouting(state?.image_asset?.shot_catalog_routing);
   if (
@@ -6609,21 +6648,22 @@ export function hmbPromptShotOptions(state) {
     item.shot_uuid === current.shot_uuid && item.channel_uuid === current.channel_uuid
   ));
   return [
-    ...(state?.multi_shot_enabled ? [] : [
+    ...(state?.multi_shot_enabled || exact ? [] : [
     {
-      value: HMB_PROMPT_ONLY_SHOT_VALUE,
+      value: "",
       shot_uuid: "",
       channel_uuid: "",
       number: 0,
-      name: "샷 선택",
-      selected: !exact,
-      only: true,
+      name: catalog.length
+        ? (uiLanguage(state) === "ko" ? "샷 선택" : "Select Shot")
+        : (uiLanguage(state) === "ko" ? "ImageAsset 샷 연결 필요" : "Connect an ImageAsset Shot"),
+      selected: true,
+      placeholder: true,
     }]),
     ...catalog.map((item) => ({
       ...item,
       value: item.shot_uuid,
       selected: item.shot_uuid === exact?.shot_uuid,
-      only: false,
     })),
   ];
 }
@@ -6636,7 +6676,7 @@ function hmbPromptShotOptionNodes(selector) {
 }
 
 function hmbPromptShotOptionLabel(item) {
-  return item.only
+  return item.placeholder
     ? "샷 선택"
     : `${String(item.number).padStart(2, "0")} · ${item.name}`;
 }
@@ -6675,8 +6715,9 @@ export function hmbPatchPromptShotSelector(container, state) {
     if (option.value !== item.value) option.value = item.value;
     if (option.textContent !== label) option.textContent = label;
     if (option.selected !== Boolean(item.selected)) option.selected = Boolean(item.selected);
+    if (option.disabled !== Boolean(item.placeholder)) option.disabled = Boolean(item.placeholder);
     if (option.getAttribute?.("value") !== item.value) option.setAttribute?.("value", item.value);
-    if (item.only) {
+    if (item.placeholder) {
       if (option.hasAttribute?.("data-shot-number")) option.removeAttribute?.("data-shot-number");
     } else if (option.getAttribute?.("data-shot-number") !== String(item.number)) {
       option.setAttribute?.("data-shot-number", String(item.number));
@@ -6696,9 +6737,9 @@ export function hmbPatchPromptShotSelector(container, state) {
   });
 
   const selected = desired.find((item) => item.selected) || desired[0];
-  const selectedValue = selected?.value || HMB_PROMPT_ONLY_SHOT_VALUE;
+  const selectedValue = selected?.value || "";
   if (selector.value !== selectedValue) selector.value = selectedValue;
-  const hasRemote = desired.length > 1;
+  const hasRemote = desired.some((item) => !item.placeholder);
   const shouldDisable = !hasRemote || Boolean(state?.disabled);
   if (selector.disabled !== shouldDisable) selector.disabled = shouldDisable;
   if (shouldDisable) {
@@ -6748,13 +6789,10 @@ export function hmbPromptNonShotStateFingerprint(stateValue) {
 function renderShotSelector(state) {
   if (state.multi_shot_enabled) return "";
   const options = hmbPromptShotOptions(state);
-  const hasRemote = options.length > 1;
+  const hasRemote = options.some((item) => !item.placeholder);
   const remoteStatus = hasRemote ? "<i>REMOTE</i>" : "";
   const markup = options.map((item) => {
-    const label = item.only
-      ? "샷 선택"
-      : `${String(item.number).padStart(2, "0")} · ${item.name}`;
-    return `<option value="${escapeHtml(item.value)}"${item.only ? "" : ` data-shot-number="${item.number}"`}${item.selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    return `<option value="${escapeHtml(item.value)}"${item.placeholder ? " disabled" : ` data-shot-number="${item.number}"`}${item.selected ? " selected" : ""}>${escapeHtml(hmbPromptShotOptionLabel(item))}</option>`;
   }).join("");
   return `<label class="shot-selector-shell"><span>SHOT</span><select class="shot-selector" data-shot-selector aria-label="Active Shot"${hasRemote && !state.disabled ? "" : " disabled"}>${markup}</select>${remoteStatus}</label>`;
 }
@@ -9836,18 +9874,6 @@ function hmbNativeUiImplementation(container, props) {
       sharedControls.add(shotSelector);
       const handler = () => {
         const shotUuid = clean(shotSelector.value);
-        if (shotUuid === HMB_PROMPT_ONLY_SHOT_VALUE) {
-          if (state.manual_rebind?.required) return;
-          state.shot = normalizeShotSelection({});
-          hmbCommitLocalPromptStructure(
-            container,
-            props,
-            state,
-            remount,
-            () => hmbApplyPromptShotFeedback(container, state),
-          );
-          return;
-        }
         if (!shotUuid) return;
         const catalog = hmbPromptVerifiedShotCatalog(state);
         const selected = catalog.find((item) => item.shot_uuid === shotUuid);

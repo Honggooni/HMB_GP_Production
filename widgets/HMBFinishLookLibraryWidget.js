@@ -121,7 +121,7 @@ const HMB_TEXT = Object.freeze({
     subtitle: "Character Beauty",
     language: "Language",
     shot: "SHOT",
-    only: "Only",
+    shotPending: "Waiting for Shot connection",
     bound: "BOUND",
     beauty: "CHARACTER BEAUTY",
     enable: "Enable",
@@ -144,7 +144,7 @@ const HMB_TEXT = Object.freeze({
     subtitle: "캐릭터 뷰티",
     language: "언어",
     shot: "SHOT",
-    only: "Only",
+    shotPending: "샷 연결 대기 중",
     bound: "BOUND",
     beauty: "캐릭터 뷰티",
     enable: "사용",
@@ -331,6 +331,7 @@ export function hmbNormalizeFinishLookShotSelection(value, catalogValue = {}) {
 }
 
 function hmbFinishLookBoundShot(state) {
+  if (state?.shot_catalog_live === false) return null;
   const catalog = hmbNormalizeFinishLookShotCatalog(state?.shot_catalog);
   const current = hmbNormalizeFinishLookShotSelection(state?.shot, catalog);
   if (!catalog.channel_uuid || current.channel_uuid !== catalog.channel_uuid) return null;
@@ -340,28 +341,15 @@ function hmbFinishLookBoundShot(state) {
 }
 
 export function hmbFinishLookShotOptions(state) {
+  if (state?.shot_catalog_live === false) return [];
   const catalog = hmbNormalizeFinishLookShotCatalog(state?.shot_catalog);
   const selected = hmbFinishLookBoundShot(state);
-  const options = [{
-    key: HMB_FINISH_LOOK_ONLY_SHOT_VALUE,
-    channel_uuid: "",
-    shot_uuid: "",
-    number: 0,
-    name: "Only",
-    revision: 0,
-    selected: !selected,
-    only: true,
-  }];
-  for (const shot of catalog.shots || []) {
-    options.push({
-      key: `${catalog.channel_uuid}\u001f${shot.shot_uuid}`,
-      channel_uuid: catalog.channel_uuid,
-      ...shot,
-      selected: shot.shot_uuid === selected?.shot_uuid,
-      only: false,
-    });
-  }
-  return options;
+  return (catalog.shots || []).map(shot => ({
+    key: `${catalog.channel_uuid}\u001f${shot.shot_uuid}`,
+    channel_uuid: catalog.channel_uuid,
+    ...shot,
+    selected: shot.shot_uuid === selected?.shot_uuid,
+  }));
 }
 
 export function hmbFinishLookPaletteShotNumber(state) {
@@ -441,6 +429,7 @@ export function hmbNormalizeFinishLookWidgetValue(input = {}) {
     schema_version: HMB_FINISH_LOOK_WIDGET_SCHEMA_VERSION,
     language: hmbLanguage(source.language),
     remote_connected: hmbBoolean(source.remote_connected, false),
+    ...(source.ui_transport?.shot_catalog_live === false || source.shot_catalog_live === false ? { shot_catalog_live: false } : {}),
     shot_catalog: shotCatalog,
     shot,
     finish_look: {
@@ -550,14 +539,19 @@ function hmbSelectOptions(options, current, labels = {}) {
 }
 
 export function hmbFinishLookShotOptionLabel(item) {
-  return item?.only
-    ? "Only"
-    : `${String(item?.number || 1).padStart(2, "0")} · ${item?.name || `Shot ${item?.number || 1}`}`;
+  return item.label ?? `${String(item.number).padStart(2, "0")} · ${item.name}`;
+}
+
+function hmbFinishLookShotPickerRows(state) {
+  const shots = hmbFinishLookShotOptions(state);
+  if (shots.some(shot => shot.selected)) return shots;
+  const pending = {key: "", label: hmbFinishLookLabels(state.language).shotPending, disabled: true, selected: true};
+  return [pending, ...shots];
 }
 
 function hmbFinishLookShotOptionsMarkup(state) {
-  return hmbFinishLookShotOptions(state).map((item) => (
-    `<option value="${hmbEscape(item.key)}"${item.only ? "" : ` data-shot-number="${item.number}"`}${item.selected ? " selected" : ""}>${hmbEscape(hmbFinishLookShotOptionLabel(item))}</option>`
+  return hmbFinishLookShotPickerRows(state).map((item) => (
+    `<option value="${hmbEscape(item.key)}"${item.disabled ? " disabled" : ` data-shot-number="${item.number}"`}${item.selected ? " selected" : ""}>${hmbEscape(hmbFinishLookShotOptionLabel(item))}</option>`
   )).join("");
 }
 
@@ -568,7 +562,7 @@ function hmbFinishLookShotOptionNodes(select) {
 
 export function hmbSyncFinishLookShotSelect(select, state) {
   if (!select) return false;
-  const desired = hmbFinishLookShotOptions(state);
+  const desired = hmbFinishLookShotPickerRows(state);
   const existingNodes = hmbFinishLookShotOptionNodes(select);
   const existing = new Map(existingNodes.map((option) => [String(option?.value || ""), option]));
   const ownerDocument = select.ownerDocument
@@ -596,7 +590,8 @@ export function hmbSyncFinishLookShotSelect(select, state) {
     }
     option.selected = Boolean(item.selected);
     option.setAttribute?.("value", item.key);
-    if (item.only) option.removeAttribute?.("data-shot-number");
+    option.disabled = Boolean(item.disabled);
+    if (item.disabled) option.removeAttribute?.("data-shot-number");
     else option.setAttribute?.("data-shot-number", String(item.number));
     const ordered = hmbFinishLookShotOptionNodes(select);
     const currentAtIndex = ordered[desiredIndex] || null;
@@ -610,12 +605,12 @@ export function hmbSyncFinishLookShotSelect(select, state) {
     if (!retained.has(value)) { option.remove?.(); changed = true; }
   });
   const selected = desired.find((item) => item.selected) || desired[0];
-  const selectedValue = selected?.key || HMB_FINISH_LOOK_ONLY_SHOT_VALUE;
+  const selectedValue = selected?.key ?? "";
   if (String(select.value || "") !== selectedValue) {
     select.value = selectedValue;
     changed = true;
   }
-  const disabled = desired.length <= 1;
+  const disabled = !desired.some(item => !item.disabled);
   if (Boolean(select.disabled) !== disabled) changed = true;
   select.disabled = disabled;
   if (disabled) select.setAttribute?.("disabled", "");
@@ -664,7 +659,7 @@ export function hmbFinishLookStepLabel(path, value, language = "ko") {
 }
 
 export function hmbFinishLookFieldEnabled(state, path) {
-  if (!Object.hasOwn(HMB_FINISH_LOOK_STEPS, path) || state.remote_connected || shotHasStatus(state, "shot_edit_locks")) return false;
+  if (!Object.hasOwn(HMB_FINISH_LOOK_STEPS, path) || !hmbFinishLookCanEdit(state)) return false;
   const beauty = state.finish_look?.beauty;
   if (!beauty?.enabled) return false;
   if (["beauty.glow_threshold", "beauty.glow_width"].includes(path)) {
@@ -674,9 +669,13 @@ export function hmbFinishLookFieldEnabled(state, path) {
   return true;
 }
 
+function hmbFinishLookCanEdit(state) {
+  return Boolean(hmbFinishLookBoundShot(state) && !state.remote_connected && !shotHasStatus(state, "shot_edit_locks"));
+}
+
 export function hmbApplyFinishLookControlAvailability(container, state) {
   const beauty = container.querySelector?.('[data-enable="beauty"]');
-  const locked = Boolean(state.remote_connected || shotHasStatus(state, "shot_edit_locks"));
+  const locked = !hmbFinishLookCanEdit(state);
   if (beauty && beauty.disabled !== locked) beauty.disabled = locked;
   for (const input of container.querySelectorAll?.("[data-finish-step]") || []) {
     const disabled = !hmbFinishLookFieldEnabled(state, input.getAttribute("data-finish-step"));
@@ -689,7 +688,7 @@ function hmbApplyFinishLookActiveEditor(container, state) {
   if(!root)return false;
   const attribute=(element,name,value)=>{if(element?.getAttribute(name)!==String(value))element?.setAttribute(name,String(value));};
   attribute(root,"data-shot-number",hmbFinishLookPaletteShotNumber(state));
-  attribute(root,"data-shot-bound",Boolean(state.shot.shot_uuid));
+  attribute(root,"data-shot-bound",Boolean(hmbFinishLookBoundShot(state)));
   const locked = shotHasStatus(state, "shot_edit_locks");
   attribute(root,"data-render-locked",locked);
   for(const button of container.querySelectorAll?.("[data-finish-shot]") || []){
@@ -723,7 +722,7 @@ function hmbRenderFinishLook(state) {
   const paletteShotNumber = hmbFinishLookPaletteShotNumber(state);
   const shotBound = paletteShotNumber > 0;
   const shotOptions = hmbFinishLookShotOptions(state);
-  const managed = state.shot_manager && Boolean(state.shot_catalog.channel_uuid);
+  const managed = state.shot_manager && shotOptions.length > 0;
   const renderLocked = shotHasStatus(state, "shot_edit_locks");
   const tabs = managed ? state.shot_catalog.shots.map(shot => {
     const locked = shotHasStatus(state, "shot_edit_locks", shot.shot_uuid);
@@ -771,11 +770,11 @@ function hmbRenderFinishLook(state) {
       [data-hmb-shot-check="true"]{display:inline-flex!important;align-items:center;justify-content:center;gap:2px!important;width:38px!important;min-width:38px!important;max-width:38px!important;height:30px!important;min-height:30px!important;max-height:30px!important;flex:none!important;padding:0!important;box-sizing:border-box!important;font:700 11px/1 system-ui!important;font-variant-numeric:tabular-nums;background:#12301d!important;color:#dcfce7!important;border:1px solid #4ade80!important;border-radius:5px!important;filter:none!important;opacity:1!important}[data-hmb-shot-check="true"]::before{content:"✓";font:900 20px/1 system-ui;color:#4ade80;flex:none}
     </style>
     <div class="hmb-finish-look nodrag" data-render-locked="${renderLocked}" data-language="${state.language}" data-remote-connected="${remoteLocked ? "true" : "false"}" data-shot-number="${paletteShotNumber}" data-shot-bound="${shotBound ? "true" : "false"}" data-workspace-mode="finish" tabindex="0">
-        <header class="hmb-finish-look__topbar group"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><div class="hmb-finish-look__native-identity" data-hmb-native-identity></div><div class="hmb-finish-look__native-actions nodrag" data-hmb-native-actions></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle${managed ? " hidden" : ""}><span data-finish-selected-number data-hmb-shot-check="${shotHasStatus(state, 'verified_shots')}" title="${shotHasStatus(state, 'verified_shots') ? (state.language === 'ko' ? '완료' : 'Complete') : ''}">${shotBound ? String(paletteShotNumber).padStart(2,"0") : hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length > 1 ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select><small data-finish-selection-status>${finishShotStatus(state)}</small></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
+        <header class="hmb-finish-look__topbar group"><div class="hmb-finish-look__mark" aria-hidden="true">${headerMark}</div><div class="hmb-finish-look__heading"><b>${hmbEscape(headerTitle)}</b><span>${hmbEscape(headerSubtitle)}</span></div><div class="hmb-finish-look__native-identity" data-hmb-native-identity></div><div class="hmb-finish-look__native-actions nodrag" data-hmb-native-actions></div><label class="hmb-finish-look__shot-shell nodrag" data-no-finish-toggle${managed ? " hidden" : ""}><span data-finish-selected-number data-hmb-shot-check="${shotHasStatus(state, 'verified_shots')}" title="${shotHasStatus(state, 'verified_shots') ? (state.language === 'ko' ? '완료' : 'Complete') : ''}">${shotBound ? String(paletteShotNumber).padStart(2,"0") : hmbEscape(t.shot)}</span><select class="hmb-finish-look__shot-select nodrag" data-shot-selector aria-label="Shot"${shotOptions.length ? "" : " disabled"}>${hmbFinishLookShotOptionsMarkup(state)}</select><small data-finish-selection-status>${finishShotStatus(state)}</small></label><span class="hmb-finish-look__bound-badge" data-shot-bound-badge${shotBound ? "" : " hidden"}>${hmbEscape(t.bound)}</span><span class="hmb-finish-look__remote-badge"${remoteLocked ? "" : " hidden"}>REMOTE</span><button type="button" class="hmb-finish-look__language nodrag" data-no-finish-toggle data-language-toggle aria-label="${hmbEscape(t.language)}">${state.language === "ko" ? "한국어" : "EN"}</button></header>
         <nav class="hmb-finish-look__shot-tabs nodrag" aria-label="Shots"${managed ? "" : " hidden"}>${tabs}</nav>
       <div class="hmb-finish-look__scroll nodrag">
         <main class="hmb-finish-look__content">
-          <section class="hmb-finish-look__section" data-finish-section="beauty"><header class="hmb-finish-look__section-header"><h2>${hmbEscape(t.beauty)}</h2><label class="hmb-finish-look__enable"><input type="checkbox" data-enable="beauty"${beauty.enabled ? " checked" : ""}${remoteLocked || renderLocked ? " disabled" : ""}><span>${hmbEscape(t.enable)}</span></label></header><div class="hmb-finish-look__section-body"><div class="hmb-finish-look__subhead">${hmbEscape(t.primary)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.soften_shadows", t.softenShadows, beauty.soften_shadows, beautyDisabled)}${hmbNumericField("beauty.shadow_threshold", t.shadowThreshold, beauty.shadow_threshold, beautyDisabled)}${hmbNumericField("beauty.saturation", t.saturation, beauty.saturation, beautyDisabled)}${hmbNumericField("beauty.brightness", t.brightness, beauty.brightness, beautyDisabled)}</div><div class="hmb-finish-look__subhead">${hmbEscape(t.advanced)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.glow_brightness", t.glowBrightness, beauty.glow_brightness, beautyDisabled)}${hmbNumericField("beauty.glow_threshold", t.glowThreshold, beauty.glow_threshold, beautyDisabled)}${hmbNumericField("beauty.glow_width", t.glowWidth, beauty.glow_width, beautyDisabled)}${hmbNumericField("beauty.soft_focus", t.softFocus, beauty.soft_focus, beautyDisabled)}${hmbNumericField("beauty.blur_amount", t.blurAmount, beauty.blur_amount, beautyDisabled)}${hmbNumericField("beauty.pore_size", t.poreSize, beauty.pore_size, beautyDisabled)}${hmbNumericField("beauty.reduce_shine", t.reduceShine, beauty.reduce_shine, beautyDisabled)}</div></div></section>
+          <section class="hmb-finish-look__section" data-finish-section="beauty"><header class="hmb-finish-look__section-header"><h2>${hmbEscape(t.beauty)}</h2><label class="hmb-finish-look__enable"><input type="checkbox" data-enable="beauty"${beauty.enabled ? " checked" : ""}${!hmbFinishLookCanEdit(state) ? " disabled" : ""}><span>${hmbEscape(t.enable)}</span></label></header><div class="hmb-finish-look__section-body"><div class="hmb-finish-look__subhead">${hmbEscape(t.primary)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.soften_shadows", t.softenShadows, beauty.soften_shadows, beautyDisabled)}${hmbNumericField("beauty.shadow_threshold", t.shadowThreshold, beauty.shadow_threshold, beautyDisabled)}${hmbNumericField("beauty.saturation", t.saturation, beauty.saturation, beautyDisabled)}${hmbNumericField("beauty.brightness", t.brightness, beauty.brightness, beautyDisabled)}</div><div class="hmb-finish-look__subhead">${hmbEscape(t.advanced)}</div><div class="hmb-finish-look__grid">${hmbNumericField("beauty.glow_brightness", t.glowBrightness, beauty.glow_brightness, beautyDisabled)}${hmbNumericField("beauty.glow_threshold", t.glowThreshold, beauty.glow_threshold, beautyDisabled)}${hmbNumericField("beauty.glow_width", t.glowWidth, beauty.glow_width, beautyDisabled)}${hmbNumericField("beauty.soft_focus", t.softFocus, beauty.soft_focus, beautyDisabled)}${hmbNumericField("beauty.blur_amount", t.blurAmount, beauty.blur_amount, beautyDisabled)}${hmbNumericField("beauty.pore_size", t.poreSize, beauty.pore_size, beautyDisabled)}${hmbNumericField("beauty.reduce_shine", t.reduceShine, beauty.reduce_shine, beautyDisabled)}</div></div></section>
         </main>
         <div class="hmb-finish-look__status" data-status role="status" aria-live="polite" data-tone="neutral">${hmbEscape(t.ready)}</div>
       </div>
@@ -1206,7 +1205,7 @@ function hmbNativeUiImplementation(container, props) {
       }
       const previous = cloneState();
       const previousKey = hmbFinishLookShotKey(state);
-      state.shot = option.only ? hmbFinishLookOnlyShot() : {
+      state.shot = {
         channel_uuid: option.channel_uuid,
         shot_uuid: option.shot_uuid,
         number: option.number,
@@ -1223,7 +1222,7 @@ function hmbNativeUiImplementation(container, props) {
     });
     for (const toggle of container.querySelectorAll?.("[data-enable]") || []) {
       bind(toggle, "change", () => {
-        if (state.remote_connected || shotHasStatus(state,"shot_edit_locks")) return;
+        if (!hmbFinishLookCanEdit(state)) return;
         const group = toggle.getAttribute("data-enable");
         if (group !== "beauty") return;
         const enabled = Boolean(toggle.checked);
@@ -1287,10 +1286,9 @@ function hmbNativeUiImplementation(container, props) {
         const catalogOlder = nextState.shot_catalog.channel_uuid === state.shot_catalog.channel_uuid
           && Number(nextState.shot_catalog.generation || 0) < Number(state.shot_catalog.generation || 0);
         const catalog = catalogOlder ? state.shot_catalog : nextState.shot_catalog;
-        const targetAvailable = pendingShot.targetKey === HMB_FINISH_LOOK_ONLY_SHOT_VALUE
-          || (catalog.shots || []).some(
-            (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pendingShot.targetKey,
-          );
+        const targetAvailable = (catalog.shots || []).some(
+          (shot) => `${catalog.channel_uuid}\u001f${shot.shot_uuid}` === pendingShot.targetKey,
+        );
         if (targetAvailable && pendingShot.blockedKeys.has(incomingKey)) {
           const statusChanged = JSON.stringify(state.shot_edit_locks) !== JSON.stringify(nextState.shot_edit_locks)
             || JSON.stringify(state.verified_shots) !== JSON.stringify(nextState.verified_shots);

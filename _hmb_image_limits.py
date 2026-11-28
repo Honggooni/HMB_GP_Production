@@ -14,7 +14,7 @@ from typing import Any
 
 
 MAX_IMAGE_PIXELS = 36_000_000
-MAX_IMAGE_BYTES = 30 * 1024 * 1024
+MAX_IMAGE_BYTES = 30_000_000
 
 _MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp",
          "BMP": "image/bmp", "GIF": "image/gif", "TIFF": "image/tiff",
@@ -174,7 +174,7 @@ def _inspect_image(data: bytes | bytearray, *, media_name: str, reference_ordina
     if not isinstance(data, (bytes, bytearray)) or not data:
         raise SeedanceImageLimitError("SEEDANCE_IMAGE_INVALID", f"{label} has no encoded image bytes.", {})
     size = len(data)
-    # Preserve the existing transport contract: encoded image bytes must be < 30 MiB.
+    # Match the exclusive byte cap on the Broker image upload proof.
     if size >= max_bytes:
         raise SeedanceImageLimitError("SEEDANCE_IMAGE_BYTE_LIMIT",
                                       f"{label} contains {size:,} bytes; must be smaller than {max_bytes:,} bytes.",

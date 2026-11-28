@@ -781,16 +781,12 @@ class HMBImageGeneration(SuccessFailureNode):
 
     @staticmethod
     async def _prepare_references(references: tuple[Any, ...]) -> tuple[Any, ...]:
-        result = []
-        for value in references:
-            if isinstance(value, str) and urlsplit(value).scheme in {"http", "https"}:
-                try:
-                    value = await File(value).aread_data_uri(fallback_mime="image/png")
-                except Exception as exc:
-                    raise ImageGenerationError("An input image could not be loaded. No image was submitted.",
-                        code="INVALID_REFERENCE") from exc
-            result.append(value)
-        return tuple(result)
+        from HMBImageAssetLibrary import require_registered_shared_image
+
+        try:
+            return await asyncio.to_thread(lambda: tuple(require_registered_shared_image(value) for value in references))
+        except ValueError as exc:
+            raise ImageGenerationError(str(exc), code="INVALID_REFERENCE") from exc
 
     def _capture_inputs(self) -> tuple[dict[str, Any], tuple[Any, ...], str]:
         if self._model_settings_error:
