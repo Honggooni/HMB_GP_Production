@@ -6605,7 +6605,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if projected is None:
             return False
         if not force and getattr(self, "parameter_values", {}).get("prompt") == projected:
-            if self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER):
+            if self._has_saved_render_authoring():
                 self._sync_seedance_shot_widget(emit_change=True)
             return False
         self._hmb_prompt_projection_syncing = True
@@ -7116,6 +7116,8 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         if not initial_setup and not getattr(self, "_hmb_shot_syncing", False):
             if param_name in _SHOT_RENDER_EDIT_FIELDS and value != self.get_parameter_value(param_name):
                 self._assert_render_setting_editable(param_name)
+        if initial_setup and param_name in (DRAFT_SOURCE_PARAMETER, DRAFT_SOURCES_PARAMETER, SEEDANCE_RECOVERY_PARAMETER):
+            self._remember_restored_draft_picker(param_name, value)
         if param_name == "local_video_upload_service":
             value = LOCAL_VIDEO_UPLOAD_GRIPTAPE
         elif param_name == "auto_publish_local_videos":
@@ -7891,8 +7893,7 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             SHOT_UUID_PARAMETER, SHOT_CHANNEL_UUID_PARAMETER, BROKER_SERVER_URL_PARAMETER, ONLY_PROJECT_PARAMETER}
         render_input_changed = parameter.name in _RENDER_AUTHORING_FIELDS | {SHOT_ASSET_INPUT_PARAMETER, SHOT_PICKER_INPUT_PARAMETER,
             SHOT_SOUND_INPUT_PARAMETER, SHOT_FINISH_LOOK_INPUT_PARAMETER, "resume_generation_id"}
-        if not self._hmb_shot_syncing and (header_changed or render_input_changed and (
-                self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER) or self.get_parameter_value(_my_box_node.CHECKPOINT_PARAMETER))):
+        if not self._hmb_shot_syncing and (header_changed or render_input_changed and self._has_saved_render_authoring()):
             # A header selection must publish its final authoritative mode once
             # routing and native parameter visibility have settled. The generic
             # setter echo may still contain the incoming request's old revision.
@@ -10845,6 +10846,19 @@ class HMBSeedanceGeneration(SuccessFailureNode):
         records = self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
         return records.get(self._draft_source_key(), "") if isinstance(records, dict) and records else ""
 
+    def _has_saved_render_authoring(self) -> bool:
+        """Refresh controls even when a reopened workflow has only a Draft receipt."""
+        if (self.get_parameter_value(COMPLETED_RENDER_INPUTS_PARAMETER)
+                or self.get_parameter_value(_my_box_node.CHECKPOINT_PARAMETER)
+                or self.get_parameter_value(DRAFT_SOURCE_PARAMETER)):
+            return True
+        drafts = self.get_parameter_value(DRAFT_SOURCES_PARAMETER)
+        if isinstance(drafts, dict) and drafts.get("sources"):
+            return True
+        checkpoint = self.get_parameter_value(SEEDANCE_RECOVERY_PARAMETER)
+        return isinstance(checkpoint, dict) and bool(
+            checkpoint.get("render_input_sha256") or checkpoint.get("draft_source"))
+
     def _matching_completed_render(self, draft_source: dict[str, Any] | None = None) -> bool:
         if getattr(self, "_web_owner", None) is not None or self.get_parameter_value("resume_generation_id"):
             return False
@@ -10916,6 +10930,29 @@ class HMBSeedanceGeneration(SuccessFailureNode):
                 source = recovered
         return source
 
+    def _remember_restored_draft_picker(self, parameter: str, value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        if parameter == DRAFT_SOURCES_PARAMETER:
+            sources = value.get("sources")
+            records = sources.values() if isinstance(sources, dict) else ()
+        else:
+            records = (value.get("draft_source") if parameter == SEEDANCE_RECOVERY_PARAMETER else value,)
+        drafts = [record for item in records if (record := _seedance_draft_source_value(item))
+                  and record.get("source_bindings", {}).get("video_picker") and record.get("render_input_sha256")]
+        if not drafts:
+            return
+        try:
+            picker = self._exact_incoming_source(SHOT_PICKER_INPUT_PARAMETER, "SHOT_PICKER_OUT", required=False)
+        except (ValueError, RuntimeError):
+            return
+        publisher = _seedance_uuid_text(getattr(picker, "_hmb_picker_publisher_uuid", ""))
+        if publisher:
+            if not hasattr(self, "_hmb_restored_draft_pickers"):
+                self._hmb_restored_draft_pickers = {}
+            for record in drafts:
+                self._hmb_restored_draft_pickers.setdefault(record["draft_job_id"], publisher)
+
     def _validate_draft_shot_binding(self, source: dict[str, Any]) -> None:
         origin = source.get("generation_origin") or {}
         current = self._shot_identity()
@@ -10952,11 +10989,37 @@ class HMBSeedanceGeneration(SuccessFailureNode):
             bindings[kind] = publisher
         if not bindings:
             raise ValueError("The Draft Shot source is disconnected.")
-        if bindings != source.get("source_bindings"):
+        saved = source.get("source_bindings") or {}
+        if bindings != saved and not self._matches_reopened_draft_picker(source, bindings, saved):
             raise ValueError("The Draft Shot source publisher was replaced or disconnected.")
         project = self._hmb_generation_project()
         if any(project.get(key) != source.get(key) for key in ("project_id", "project_name")):
             raise ValueError("The selected project does not match the completed Draft.")
+
+    def _matches_reopened_draft_picker(self, source: dict[str, Any], bindings: dict[str, str],
+                                      saved: dict[str, str]) -> bool:
+        # Picker's publisher UUID is per runtime. A saved receipt can retain
+        # its original UUID only when the exact edge restored with the graph
+        # still supplies this Shot and the original render authoring matches.
+        picker = bindings.get("video_picker")
+        if (not picker or not saved.get("video_picker") or {**saved, "video_picker": picker} != bindings
+                or getattr(self, "_hmb_restored_draft_pickers", {}).get(source["draft_job_id"]) != picker):
+            return False
+        origin = source["generation_origin"]
+        snapshot = self.get_parameter_value(SHOT_PICKER_INPUT_PARAMETER)
+        if (isinstance(snapshot, dict) and snapshot.get("publisher_instance_uuid") == picker
+                and snapshot.get("channel_uuid") == origin["channel_uuid"]
+                and any(isinstance(row, dict) and row.get("shot_uuid") == origin["shot_uuid"]
+                        for row in snapshot.get("shots", ()))):
+            return True  # The exact Picker Shot contributes to the verified authoring digest.
+        # Managed workflows can leave the native Generator input empty. In
+        # that graph the same Picker contributes through Prompt's fingerprint.
+        agent = self._manual_agent_prompt_source()
+        owner = getattr(agent, "_hmb_prompt_display_owner", None)
+        prompt = owner() if callable(owner) else None
+        prompt_sources = getattr(prompt, "_hmb_connected_source_nodes", {})
+        return any(getattr(prompt_sources.get(port), "_hmb_picker_publisher_uuid", None) == picker
+                   for port in (SHOT_PICKER_INPUT_PARAMETER, "PICKER_IN"))
 
     def _draft_final_status_identity(self, source: dict[str, Any]) -> tuple[str, ...]:
         bridge = self._get_broker_bridge(server_url=source["broker_server_url"])
